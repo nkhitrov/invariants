@@ -27,8 +27,6 @@ def unwrap_collection_state_types(annotation: Any) -> tuple[type[Any], ...]:
     origin = get_origin(annotation)
     if origin in (tuple, list, set, frozenset):
         args = [a for a in get_args(annotation) if a is not Ellipsis]
-        if not args:
-            return ()
         inner = args[0]
         if _is_union(get_origin(inner)):
             return tuple(a for a in get_args(inner) if a is not type(None))

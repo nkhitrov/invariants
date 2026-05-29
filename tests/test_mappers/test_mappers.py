@@ -11,6 +11,7 @@ from invariants.mappers import (
     MapperRegistryError,
     StateMapper,
 )
+from invariants.state import State
 from tests.support.orm import Base
 from tests.support.states import (
     ActiveDebt,
@@ -18,6 +19,8 @@ from tests.support.states import (
     ClosedDebt,
     ClosedLoan,
     LoanState,
+    OverdueDebt,
+    OverdueLoan,
 )
 
 
@@ -176,13 +179,27 @@ class TestMissingSubMapper:
 
 
 class TestRegistryOverwrite:
-    def test_last_definition_wins(self) -> None:
-        from invariants.mappers.base import _MAPPER_REGISTRY
+    def test_nested_resolution_uses_last_definition(self) -> None:
+        """When two mappers are defined for the same (State, ORM) pair, nested resolution uses the latest."""
+        from invariants.mappers import field_to_orm
 
-        class M1(StateMapper[ActiveLoan, _FlatLoanORM]): ...
-        class M2(StateMapper[ActiveLoan, _FlatLoanORM]): ...
+        class _FirstLoan(StateMapper[ActiveLoan, _NestedLoanORM]):
+            @field_to_orm(ActiveLoan.id)
+            def make_id(value: int) -> int:
+                return value * 10
 
-        assert _MAPPER_REGISTRY[(ActiveLoan, _FlatLoanORM)] is M2
+        class _SecondLoan(StateMapper[ActiveLoan, _NestedLoanORM]):
+            @field_to_orm(ActiveLoan.id)
+            def make_id(value: int) -> int:
+                return value * 100
+
+        class _DebtMapper(StateMapper[ActiveDebt, _NestedDebtORM]): ...
+
+        debt = ActiveDebt(loans=(ActiveLoan(id=7, postponement_date=datetime(2026, 1, 1)),))
+
+        orm = _DebtMapper.to_orm(debt)
+
+        assert orm.loans[0].id == 700
 
 
 class TestNestedRoundTrip:
@@ -196,3 +213,96 @@ class TestNestedRoundTrip:
         result = _DebtClosed.to_state(_DebtClosed.to_orm(debt))
 
         assert result == debt
+
+
+class TestToStateMissingField:
+    def test_state_field_without_orm_attribute_raises(self) -> None:
+        class _ToStateNoStatusORM(Base):
+            __tablename__ = "to_state_no_status"
+            id = Column(Integer, primary_key=True)
+            postponement_date: Mapped[datetime]
+
+        class M(StateMapper[ActiveLoan, _ToStateNoStatusORM]): ...
+
+        orm = _ToStateNoStatusORM(id=1, postponement_date=datetime(2026, 1, 1))
+
+        with pytest.raises(MapperRegistryError, match="status"):
+            M.to_state(orm)
+
+
+class TestToStateScalarStateWithRelationship:
+    def test_scalar_state_field_against_relationship_raises(self) -> None:
+        """State has a scalar nested field but the ORM exposes it as a relationship — to_state cannot resolve variants."""
+
+        class _ChildORM(Base):
+            __tablename__ = "to_state_scalar_child"
+            id: Mapped[int] = mapped_column(primary_key=True)
+            name: Mapped[str]
+            parent_id: Mapped[int | None] = mapped_column(
+                ForeignKey("to_state_scalar_parent.id"), nullable=True
+            )
+
+        class _ParentORM(Base):
+            __tablename__ = "to_state_scalar_parent"
+            id: Mapped[int] = mapped_column(primary_key=True)
+            child: Mapped[_ChildORM] = relationship(uselist=False)
+
+        class _ChildState(State):
+            id: int
+            name: str
+
+        class _ParentState(State):
+            id: int
+            child: _ChildState
+
+        class _ChildMapper(StateMapper[_ChildState, _ChildORM]): ...
+        class _ParentMapper(StateMapper[_ParentState, _ParentORM]): ...
+
+        orm = _ParentORM(id=1, child=_ChildORM(id=2, name="x"))
+
+        with pytest.raises(MapperRegistryError, match="state variants"):
+            _ParentMapper.to_state(orm)
+
+
+class TestNestedToStateVariantHandling:
+    def test_unregistered_variant_is_skipped(self) -> None:
+        """OverdueDebt has variants (OverdueLoan|ActiveLoan|ClosedLoan); ActiveLoan mapper is not registered.
+
+        For closed ORM items the resolver must skip the missing ActiveLoan mapper and try the next one.
+        """
+
+        class _OverdueMapper(StateMapper[OverdueLoan, _NestedLoanORM]): ...
+        class _ClosedMapper(StateMapper[ClosedLoan, _NestedLoanORM]): ...
+        class _DebtMapper(StateMapper[OverdueDebt, _NestedDebtORM]): ...
+
+        orm = _NestedDebtORM(
+            id=1,
+            status="overdue",
+            loans=[
+                _NestedLoanORM(id=1, status="overdue", postponement_date=datetime(2026, 1, 1)),
+                _NestedLoanORM(id=2, status="closed", postponement_date=None),
+            ],
+        )
+
+        state = _DebtMapper.to_state(orm)
+
+        assert isinstance(state, OverdueDebt)
+        assert isinstance(state.loans[0], OverdueLoan)
+        assert isinstance(state.loans[1], ClosedLoan)
+
+    def test_no_variant_matches_raises(self) -> None:
+        """When no registered variant can validate the ORM item, MapperRegistryError surfaces the validation error."""
+
+        class _ClosedMapper(StateMapper[ClosedLoan, _NestedLoanORM]): ...
+        class _DebtMapper(StateMapper[OverdueDebt, _NestedDebtORM]): ...
+
+        orm = _NestedDebtORM(
+            id=1,
+            status="overdue",
+            loans=[
+                _NestedLoanORM(id=1, status="active", postponement_date=datetime(2026, 1, 1)),
+            ],
+        )
+
+        with pytest.raises(MapperRegistryError, match="No matching state variant"):
+            _DebtMapper.to_state(orm)

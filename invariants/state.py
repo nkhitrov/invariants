@@ -11,7 +11,7 @@ def _called_from_pydantic_internals(max_depth: int = 8) -> bool:
     for depth in range(1, max_depth + 1):
         try:
             frame = sys._getframe(depth)
-        except ValueError:
+        except ValueError:  # pragma: no cover
             return False
         module = frame.f_globals.get("__name__", "")
         if module.startswith("pydantic"):
@@ -71,7 +71,7 @@ class StateMeta(ModelMetaclass):
             pass
         try:
             fields = type.__getattribute__(cls, "model_fields")
-        except AttributeError:
+        except AttributeError:  # pragma: no cover
             raise AttributeError(name) from None
         if name in fields:
             if _called_from_pydantic_internals():

@@ -164,6 +164,19 @@ class TestValidation:
                 def whatever(value: Any) -> Any:
                     return value
 
+    def test_orm_attr_from_unrelated_orm_raises(self) -> None:
+        class _OtherORM(Base):
+            __tablename__ = "decorator_other_orm"
+            id = Column(Integer, primary_key=True)
+            status: Mapped[str]
+            postponement_date: Mapped[datetime]
+
+        with pytest.raises(MapperConfigurationError, match="does not belong"):
+            class _Bad(StateMapper[ActiveLoan, _JsonDebtORM]):
+                @field_to_state(_OtherORM.status)
+                def whatever(value: Any) -> Any:
+                    return value
+
     def test_decorator_rejects_non_field_ref_arg(self) -> None:
         with pytest.raises(TypeError, match="State field reference"):
             field_to_orm("loans")
