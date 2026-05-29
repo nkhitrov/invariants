@@ -30,22 +30,58 @@ class MapperRegistryError(LookupError):
     """Raised when a required sub-mapper or field mapping cannot be resolved."""
 
 
-_MAPPER_REGISTRY: dict[tuple[type[Any], type[Any]], type["StateMapper[Any, Any]"]] = {}
+class MapperRegistry:
+    """A self-contained collection of :class:`StateMapper` subclasses.
 
+    Mappers are keyed by their ``(state, ORM)`` pair. Each base mapper owns one
+    registry, and concrete mappers register into the registry of their base.
+    This mirrors SQLAlchemy's ``MetaData``: independent registries let unrelated
+    mapper hierarchies coexist without clashing — useful, for instance, to isolate
+    mappers between tests.
+    """
 
-def reset_mapper_registry() -> None:
-    _MAPPER_REGISTRY.clear()
+    def __init__(self) -> None:
+        self._mappers: dict[
+            tuple[type[Any], type[Any]], type["StateMapper[Any, Any]"]
+        ] = {}
+
+    def register(
+        self,
+        state_cls: type[Any],
+        orm_cls: type[Any],
+        mapper: type["StateMapper[Any, Any]"],
+    ) -> None:
+        self._mappers[(state_cls, orm_cls)] = mapper
+
+    def get(
+        self, state_cls: type[Any], orm_cls: type[Any]
+    ) -> type["StateMapper[Any, Any]"] | None:
+        return self._mappers.get((state_cls, orm_cls))
+
+    def clear(self) -> None:
+        """Remove all registered mappers."""
+        self._mappers.clear()
 
 
 class StateMapper(Generic[R, T]):
     __is_base_mapper__: ClassVar[bool] = True
+    __registry__: ClassVar[MapperRegistry] = MapperRegistry()
     __state_model__: ClassVar[type[Any]]
     __sql_model__: ClassVar[type[Any]]
     _to_orm_handlers: ClassVar[dict[str, Callable[[Any], Any]]] = {}
     _to_state_handlers: ClassVar[dict[str, Callable[[Any], Any]]] = {}
 
-    def __init_subclass__(cls, **kwargs: Any) -> None:
+    def __init_subclass__(
+        cls, registry: MapperRegistry | None = None, **kwargs: Any
+    ) -> None:
         super().__init_subclass__(**kwargs)
+
+        if registry is not None:
+            # Declaring a new base mapper that owns its own registry; concrete
+            # mappers subclassing it will register into this registry.
+            cls.__registry__ = registry
+            cls.__is_base_mapper__ = True
+            return
 
         state_cls = getattr(cls, "__state_model__", None) or cls._infer_state_type()
         orm_cls = getattr(cls, "__sql_model__", None) or cls._infer_sql_model_type()
@@ -66,12 +102,18 @@ class StateMapper(Generic[R, T]):
                 f"'{orm_cls.__name__}' is an abstract model and cannot be used as '__sql_model__' on {cls.__name__}"
             )
 
+        cls.__is_base_mapper__ = False
         cls.__state_model__ = state_cls
         cls.__sql_model__ = orm_cls
         cls._to_orm_handlers = dict(cls._to_orm_handlers)
         cls._to_state_handlers = dict(cls._to_state_handlers)
         cls._collect_field_handlers()
-        _MAPPER_REGISTRY[(state_cls, orm_cls)] = cls
+        cls.__registry__.register(state_cls, orm_cls, cls)
+
+    @classmethod
+    def clear_registry(cls) -> None:
+        """Remove all mappers from this mapper's registry."""
+        cls.__registry__.clear()
 
     @classmethod
     def _collect_field_handlers(cls) -> None:
@@ -163,8 +205,7 @@ class StateMapper(Generic[R, T]):
                 elem_orm_cls = get_relationship_element_type(rels[fname])
                 mapped: list[Any] = []
                 for item in value:
-                    key = (type(item), elem_orm_cls)
-                    sub = _MAPPER_REGISTRY.get(key)
+                    sub = cls.__registry__.get(type(item), elem_orm_cls)
                     if sub is None:
                         raise MapperRegistryError(
                             f"No mapper registered for ({type(item).__name__}, {elem_orm_cls.__name__})"
@@ -201,7 +242,9 @@ class StateMapper(Generic[R, T]):
                         f"on {cls.__state_model__.__name__}"
                     )
                 items = [
-                    _build_state_variant(orm_item, variants, elem_orm_cls)
+                    _build_state_variant(
+                        orm_item, variants, elem_orm_cls, cls.__registry__
+                    )
                     for orm_item in (getattr(orm, fname) or [])
                 ]
                 data[fname] = tuple(items)
@@ -218,10 +261,11 @@ def _build_state_variant(
     orm_item: Any,
     variants: tuple[type[Any], ...],
     elem_orm_cls: type[Any],
+    registry: MapperRegistry,
 ) -> Any:
     last_err: ValidationError | None = None
     for variant in variants:
-        sub = _MAPPER_REGISTRY.get((variant, elem_orm_cls))
+        sub = registry.get(variant, elem_orm_cls)
         if sub is None:
             continue
         try:

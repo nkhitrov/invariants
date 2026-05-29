@@ -2,11 +2,11 @@ from collections.abc import Iterator
 
 import pytest
 
-from invariants.mappers import reset_mapper_registry
+from invariants.mappers import StateMapper
 
 
 @pytest.fixture(autouse=True)
 def fx_reset_registry() -> Iterator[None]:
-    reset_mapper_registry()
+    StateMapper.clear_registry()
     yield
-    reset_mapper_registry()
+    StateMapper.clear_registry()
