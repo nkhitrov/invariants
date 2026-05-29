@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, ClassVar, Generic, TypeVar, cast
 
 from polyfactory.exceptions import ConfigurationException
 from polyfactory.utils.predicates import is_type_var
 from pydantic import ValidationError
+from sqlalchemy.orm import InstrumentedAttribute
 from typing_extensions import get_args, get_origin, get_original_bases
 
 from invariants.mappers._introspect import (
@@ -14,6 +15,7 @@ from invariants.mappers._introspect import (
     get_relationship_element_type,
     unwrap_collection_state_types,
 )
+from invariants.mappers._refs import FieldRef
 from invariants.state import State
 
 R = TypeVar("R", bound=State)
@@ -39,6 +41,8 @@ class StateMapper(Generic[R, T]):
     __is_base_mapper__: ClassVar[bool] = True
     __state_model__: ClassVar[type[Any]]
     __sql_model__: ClassVar[type[Any]]
+    _to_orm_handlers: ClassVar[dict[str, Callable[[Any], Any]]] = {}
+    _to_state_handlers: ClassVar[dict[str, Callable[[Any], Any]]] = {}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -64,7 +68,57 @@ class StateMapper(Generic[R, T]):
 
         cls.__state_model__ = state_cls
         cls.__sql_model__ = orm_cls
+        cls._to_orm_handlers = dict(cls._to_orm_handlers)
+        cls._to_state_handlers = dict(cls._to_state_handlers)
+        cls._collect_field_handlers()
         _MAPPER_REGISTRY[(state_cls, orm_cls)] = cls
+
+    @classmethod
+    def _collect_field_handlers(cls) -> None:
+        orm_cols = get_orm_columns(cls.__sql_model__)
+        orm_rels = get_orm_relationships(cls.__sql_model__)
+        state_fields = cls.__state_model__.model_fields
+
+        for val in cls.__dict__.values():
+            fn = val.__func__ if isinstance(val, (classmethod, staticmethod)) else val
+            if not callable(fn):
+                continue
+            bound = (
+                val.__get__(None, cls)
+                if isinstance(val, (classmethod, staticmethod))
+                else fn
+            )
+            field_ref = getattr(fn, "_mapper_field_to_orm", None)
+            if isinstance(field_ref, FieldRef):
+                if not issubclass(cls.__state_model__, field_ref.state_cls):
+                    raise MapperConfigurationError(
+                        f"@field_to_orm on {cls.__name__}: field reference "
+                        f"{field_ref.state_cls.__name__}.{field_ref.name} does not belong to "
+                        f"{cls.__state_model__.__name__}"
+                    )
+                if field_ref.name not in orm_cols and field_ref.name not in orm_rels:
+                    raise MapperConfigurationError(
+                        f"@field_to_orm on {cls.__name__}: ORM model "
+                        f"{cls.__sql_model__.__name__} has no attribute '{field_ref.name}'"
+                    )
+                cls._to_orm_handlers[field_ref.name] = bound
+            orm_attr = getattr(fn, "_mapper_field_to_state", None)
+            if isinstance(orm_attr, InstrumentedAttribute):
+                attr_owner = cast("type[Any]", orm_attr.class_)
+                if attr_owner is not cls.__sql_model__ and not issubclass(
+                    cls.__sql_model__, attr_owner
+                ):
+                    raise MapperConfigurationError(
+                        f"@field_to_state on {cls.__name__}: ORM attribute "
+                        f"{attr_owner.__name__}.{orm_attr.key} does not belong to "
+                        f"{cls.__sql_model__.__name__}"
+                    )
+                if orm_attr.key not in state_fields:
+                    raise MapperConfigurationError(
+                        f"@field_to_state on {cls.__name__}: State model "
+                        f"{cls.__state_model__.__name__} has no field '{orm_attr.key}'"
+                    )
+                cls._to_state_handlers[orm_attr.key] = bound
 
     @classmethod
     def _infer_state_type(cls) -> type[R] | None:
@@ -99,6 +153,10 @@ class StateMapper(Generic[R, T]):
 
         for fname in type(state).model_fields:
             value = getattr(state, fname)
+            handler = cls._to_orm_handlers.get(fname)
+            if handler is not None:
+                payload[fname] = handler(value)
+                continue
             if fname in cols:
                 payload[fname] = value
             elif fname in rels:
@@ -128,6 +186,10 @@ class StateMapper(Generic[R, T]):
         data: dict[str, Any] = {}
 
         for fname, finfo in cls.__state_model__.model_fields.items():
+            handler = cls._to_state_handlers.get(fname)
+            if handler is not None:
+                data[fname] = handler(getattr(orm, fname))
+                continue
             if fname in cols:
                 data[fname] = getattr(orm, fname)
             elif fname in rels:
