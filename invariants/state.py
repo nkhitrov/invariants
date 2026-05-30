@@ -1,22 +1,9 @@
 from __future__ import annotations
 
-import sys
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic._internal._model_construction import ModelMetaclass
-
-
-def _called_from_pydantic_internals(max_depth: int = 8) -> bool:
-    for depth in range(1, max_depth + 1):
-        try:
-            frame = sys._getframe(depth)
-        except ValueError:  # pragma: no cover
-            return False
-        module = frame.f_globals.get("__name__", "")
-        if module.startswith("pydantic"):
-            return True
-    return False
 
 if TYPE_CHECKING:
     Statefull = Any
@@ -62,25 +49,6 @@ class StateMeta(ModelMetaclass):
                 if is_root_child(base):
                     cls._validate_typing_any_override(base)
 
-    def __getattr__(cls, name: str) -> Any:
-        if name.startswith("_"):
-            raise AttributeError(name)
-        try:
-            return super().__getattr__(name)  # type: ignore[misc]
-        except AttributeError:
-            pass
-        try:
-            fields = type.__getattribute__(cls, "model_fields")
-        except AttributeError:  # pragma: no cover
-            raise AttributeError(name) from None
-        if name in fields:
-            if _called_from_pydantic_internals():
-                raise AttributeError(name)
-            from invariants.mappers._refs import FieldRef
-
-            return FieldRef(cls, name)
-        raise AttributeError(name)
-
     def _validate_only_parent_fields_allowed(cls, bases: tuple[type, ...]) -> None:
         parent_fields: set[str] = set()
         for base in bases:
@@ -97,12 +65,13 @@ class StateMeta(ModelMetaclass):
 
     def _validate_typing_any_override(cls, base: type) -> None:
         invalid_fields = []
-        model_fields = getattr(base, "model_fields", {})
-        for field_name, field_info in model_fields.items():
+        base_fields = getattr(base, "model_fields", {})
+        cls_fields = getattr(cls, "model_fields", {})
+        for field_name, field_info in base_fields.items():
             if (
                 field_info.annotation is Statefull
-                and field_name in cls.model_fields
-                and cls.model_fields[field_name].annotation is Statefull
+                and field_name in cls_fields
+                and cls_fields[field_name].annotation is Statefull
             ):
                 invalid_fields.append(field_name)
 

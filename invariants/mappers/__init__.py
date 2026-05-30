@@ -1,18 +1,20 @@
-from invariants.mappers._refs import FieldRef
 from invariants.mappers.base import (
+    Dumper,
+    Loader,
+    Mapper,
     MapperConfigurationError,
     MapperRegistry,
     MapperRegistryError,
-    StateMapper,
 )
-from invariants.mappers.decorators import field_to_orm, field_to_state
+from invariants.mappers.decorators import dump, load
 
 __all__ = [
-    "FieldRef",
+    "Dumper",
+    "Loader",
+    "Mapper",
     "MapperConfigurationError",
     "MapperRegistry",
     "MapperRegistryError",
-    "StateMapper",
-    "field_to_orm",
-    "field_to_state",
+    "dump",
+    "load",
 ]

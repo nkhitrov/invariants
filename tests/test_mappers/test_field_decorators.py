@@ -8,10 +8,11 @@ from sqlalchemy import JSON, Column, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 
 from invariants.mappers import (
+    Dumper,
+    Loader,
     MapperConfigurationError,
-    StateMapper,
-    field_to_orm,
-    field_to_state,
+    dump,
+    load,
 )
 from tests.support.orm import Base
 from tests.support.states import (
@@ -30,17 +31,20 @@ class _JsonDebtORM(Base):
 
 
 class TestJsonCollectionDecorators:
-    def _build_mapper(self) -> type[StateMapper[ActiveDebt, _JsonDebtORM]]:
-        class DebtMapper(StateMapper[ActiveDebt, _JsonDebtORM]):
-            @field_to_orm(ActiveDebt.loans)
-            def loans_to_orm(value: tuple[ActiveLoan | ClosedLoan, ...]) -> list[dict[str, Any]]:
-                result: list[dict[str, Any]] = []
-                for loan in value:
-                    result.append(loan.model_dump())
-                return result
+    def _build_mappers(
+        self,
+    ) -> tuple[
+        type[Dumper[ActiveDebt, _JsonDebtORM]],
+        type[Loader[ActiveDebt, _JsonDebtORM]],
+    ]:
+        class DebtDumper(Dumper[ActiveDebt, _JsonDebtORM]):
+            @dump
+            def loans(value: tuple[ActiveLoan | ClosedLoan, ...]) -> list[dict[str, Any]]:
+                return [loan.model_dump() for loan in value]
 
-            @field_to_state(_JsonDebtORM.loans)
-            def loans_to_state(
+        class DebtLoader(Loader[ActiveDebt, _JsonDebtORM]):
+            @load
+            def loans(
                 value: list[dict[str, Any]] | None,
             ) -> tuple[ActiveLoan | ClosedLoan, ...]:
                 raw = value or []
@@ -52,10 +56,10 @@ class TestJsonCollectionDecorators:
                         out.append(ClosedLoan.model_validate(item))
                 return tuple(out)
 
-        return DebtMapper
+        return DebtDumper, DebtLoader
 
-    def test_to_orm_writes_serialized_list(self) -> None:
-        mapper = self._build_mapper()
+    def test_dump_writes_serialized_list(self) -> None:
+        dumper, _ = self._build_mappers()
 
         debt = ActiveDebt(
             loans=(
@@ -64,7 +68,7 @@ class TestJsonCollectionDecorators:
             )
         )
 
-        orm = mapper.to_orm(debt)
+        orm = dumper.dump(debt)
 
         assert isinstance(orm, _JsonDebtORM)
         assert orm.status == "active"
@@ -75,8 +79,8 @@ class TestJsonCollectionDecorators:
         assert orm.loans[1]["status"] == "closed"
         assert orm.loans[1]["id"] == 2
 
-    def test_to_state_discriminates_variants(self) -> None:
-        mapper = self._build_mapper()
+    def test_load_discriminates_variants(self) -> None:
+        _, loader = self._build_mappers()
 
         orm = _JsonDebtORM(
             id=10,
@@ -87,7 +91,7 @@ class TestJsonCollectionDecorators:
             ],
         )
 
-        state = mapper.to_state(orm)
+        state = loader.load(orm)
 
         assert isinstance(state, ActiveDebt)
         assert state.status == "active"
@@ -96,7 +100,7 @@ class TestJsonCollectionDecorators:
         assert isinstance(state.loans[1], ClosedLoan)
 
     def test_round_trip(self) -> None:
-        mapper = self._build_mapper()
+        dumper, loader = self._build_mappers()
         debt = ActiveDebt(
             loans=(
                 ActiveLoan(id=7, postponement_date=datetime(2026, 2, 2)),
@@ -104,46 +108,54 @@ class TestJsonCollectionDecorators:
             )
         )
 
-        result = mapper.to_state(mapper.to_orm(debt))
+        result = loader.load(dumper.dump(debt))
 
         assert result == debt
 
 
 class TestClassmethodWrapping:
     def test_classmethod_handler_supported(self) -> None:
-        class DebtMapper(StateMapper[ClosedDebt, _JsonDebtORM]):
-            @field_to_orm(ClosedDebt.loans)
+        class DebtDumper(Dumper[ClosedDebt, _JsonDebtORM]):
+            @dump
             @classmethod
-            def loans_to_orm(cls, value: tuple[ClosedLoan, ...]) -> list[dict[str, Any]]:
+            def loans(cls, value: tuple[ClosedLoan, ...]) -> list[dict[str, Any]]:
                 return [v.model_dump(mode="json") for v in value]
 
-            @field_to_state(_JsonDebtORM.loans)
+        class DebtLoader(Loader[ClosedDebt, _JsonDebtORM]):
+            @load
             @staticmethod
-            def loans_to_state(value: list[dict[str, Any]] | None) -> tuple[ClosedLoan, ...]:
+            def loans(value: list[dict[str, Any]] | None) -> tuple[ClosedLoan, ...]:
                 return tuple(ClosedLoan.model_validate(v) for v in (value or []))
 
         debt = ClosedDebt(loans=(ClosedLoan(id=1), ClosedLoan(id=2)))
-        orm = DebtMapper.to_orm(debt)
+        orm = DebtDumper.dump(debt)
         assert len(orm.loans) == 2
 
-        round_trip = DebtMapper.to_state(orm)
+        round_trip = DebtLoader.load(orm)
         assert round_trip == debt
 
 
 class TestValidation:
-    def test_field_to_orm_for_unknown_orm_attribute_raises(self) -> None:
+    def test_dump_for_unknown_orm_attribute_raises(self) -> None:
         class _NoPostpORM(Base):
             __tablename__ = "decorator_no_postp_orm"
             id = Column(Integer, primary_key=True)
             status: Mapped[str]
 
         with pytest.raises(MapperConfigurationError, match="no attribute 'postponement_date'"):
-            class _Bad(StateMapper[ActiveLoan, _NoPostpORM]):
-                @field_to_orm(ActiveLoan.postponement_date)
-                def whatever(value: Any) -> Any:
+            class _Bad(Dumper[ActiveLoan, _NoPostpORM]):
+                @dump
+                def postponement_date(value: Any) -> Any:
                     return value
 
-    def test_field_to_state_for_unknown_state_field_raises(self) -> None:
+    def test_dump_for_unknown_state_field_raises(self) -> None:
+        with pytest.raises(MapperConfigurationError, match="no field 'loans'"):
+            class _Bad(Dumper[ActiveLoan, _JsonDebtORM]):
+                @dump
+                def loans(value: Any) -> Any:
+                    return value
+
+    def test_load_for_unknown_state_field_raises(self) -> None:
         class _ExtraORM(Base):
             __tablename__ = "decorator_extra_orm"
             id = Column(Integer, primary_key=True)
@@ -152,60 +164,47 @@ class TestValidation:
             unknown_col: Mapped[str] = mapped_column(default="x")
 
         with pytest.raises(MapperConfigurationError, match="no field 'unknown_col'"):
-            class _Bad(StateMapper[ActiveLoan, _ExtraORM]):
-                @field_to_state(_ExtraORM.unknown_col)
-                def whatever(value: Any) -> Any:
+            class _Bad(Loader[ActiveLoan, _ExtraORM]):
+                @load
+                def unknown_col(value: Any) -> Any:
                     return value
 
-    def test_field_ref_from_unrelated_state_raises(self) -> None:
-        with pytest.raises(MapperConfigurationError, match="does not belong"):
-            class _Bad(StateMapper[ActiveLoan, _JsonDebtORM]):
-                @field_to_orm(ActiveDebt.loans)
-                def whatever(value: Any) -> Any:
-                    return value
-
-    def test_orm_attr_from_unrelated_orm_raises(self) -> None:
-        class _OtherORM(Base):
-            __tablename__ = "decorator_other_orm"
+    def test_load_for_unknown_orm_attribute_raises(self) -> None:
+        class _ToStateNoPostpORM(Base):
+            __tablename__ = "decorator_to_state_no_postp_orm"
             id = Column(Integer, primary_key=True)
             status: Mapped[str]
-            postponement_date: Mapped[datetime]
 
-        with pytest.raises(MapperConfigurationError, match="does not belong"):
-            class _Bad(StateMapper[ActiveLoan, _JsonDebtORM]):
-                @field_to_state(_OtherORM.status)
-                def whatever(value: Any) -> Any:
+        with pytest.raises(MapperConfigurationError, match="no attribute 'postponement_date'"):
+            class _Bad(Loader[ActiveLoan, _ToStateNoPostpORM]):
+                @load
+                def postponement_date(value: Any) -> Any:
                     return value
 
-    def test_decorator_rejects_non_field_ref_arg(self) -> None:
-        with pytest.raises(TypeError, match="State field reference"):
-            field_to_orm("loans")
-
-    def test_decorator_rejects_non_instrumented_arg(self) -> None:
-        with pytest.raises(TypeError, match="ORM column reference"):
-            field_to_state("loans")
+    def test_wrong_direction_decorator_raises(self) -> None:
+        with pytest.raises(MapperConfigurationError, match="wrong direction"):
+            class _Bad(Dumper[ActiveDebt, _JsonDebtORM]):
+                @load
+                def loans(value: Any) -> Any:
+                    return value
 
 
 class TestInheritance:
     def test_child_overrides_parent_handler(self) -> None:
-        class _BaseMapper(StateMapper[ActiveDebt, _JsonDebtORM]):
-            @field_to_orm(ActiveDebt.loans)
-            def loans_to_orm(value: tuple[ActiveLoan | ClosedLoan, ...]) -> list[dict[str, Any]]:
+        class _BaseDumper(Dumper[ActiveDebt, _JsonDebtORM]):
+            @dump
+            def loans(value: tuple[ActiveLoan | ClosedLoan, ...]) -> list[dict[str, Any]]:
                 return [{"id": v.id, "marker": "parent"} for v in value]
 
-            @field_to_state(_JsonDebtORM.loans)
-            def loans_to_state(value: Any) -> tuple[ActiveLoan | ClosedLoan, ...]:
-                return ()
-
-        class _ChildMapper(_BaseMapper):
-            @field_to_orm(ActiveDebt.loans)
-            def loans_to_orm(value: tuple[ActiveLoan | ClosedLoan, ...]) -> list[dict[str, Any]]:
+        class _ChildDumper(_BaseDumper):
+            @dump
+            def loans(value: tuple[ActiveLoan | ClosedLoan, ...]) -> list[dict[str, Any]]:
                 return [{"id": v.id, "marker": "child"} for v in value]
 
         debt = ActiveDebt(loans=(ActiveLoan(id=1, postponement_date=datetime(2026, 1, 1)),))
 
-        parent_orm = _BaseMapper.to_orm(debt)
-        child_orm = _ChildMapper.to_orm(debt)
+        parent_orm = _BaseDumper.dump(debt)
+        child_orm = _ChildDumper.dump(debt)
 
         assert parent_orm.loans[0]["marker"] == "parent"
         assert child_orm.loans[0]["marker"] == "child"

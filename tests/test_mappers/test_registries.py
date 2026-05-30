@@ -8,16 +8,16 @@ from sqlalchemy import Column, ForeignKey, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from invariants.mappers import (
+    Dumper,
+    Loader,
     MapperRegistry,
     MapperRegistryError,
-    StateMapper,
 )
 from invariants.state import State
 from tests.support.orm import Base
 from tests.support.states import ActiveDebt, ActiveLoan, ClosedLoan
 
-# A base mapper must stay generic so that concrete mappers can parametrize it,
-# mirroring how a generic base is declared elsewhere.
+# A base mapper must stay generic so that concrete mappers can parametrize it.
 _R = TypeVar("_R", bound=State)
 _T = TypeVar("_T")
 
@@ -45,29 +45,29 @@ class TestIndependentRegistries:
         registry_a = MapperRegistry()
         registry_b = MapperRegistry()
 
-        class BaseA(StateMapper[_R, _T], registry=registry_a): ...
-        class BaseB(StateMapper[_R, _T], registry=registry_b): ...
+        class BaseA(Dumper[_R, _T], registry=registry_a): ...
+        class BaseB(Dumper[_R, _T], registry=registry_b): ...
 
         class LoanA(BaseA[ActiveLoan, _RegLoanORM]): ...
         class LoanB(BaseB[ActiveLoan, _RegLoanORM]): ...
 
-        # Each base mapper registered its concrete mapper into its own registry.
-        assert registry_a.get(ActiveLoan, _RegLoanORM) is LoanA
-        assert registry_b.get(ActiveLoan, _RegLoanORM) is LoanB
+        # Each base mapper registered its concrete dumper into its own registry.
+        assert registry_a.get_dumper(ActiveLoan, _RegLoanORM) is LoanA
+        assert registry_b.get_dumper(ActiveLoan, _RegLoanORM) is LoanB
 
         # The registries are unrelated: neither leaks into the other.
-        assert registry_a.get(ActiveLoan, _RegLoanORM) is not LoanB
-        assert registry_b.get(ActiveLoan, _RegLoanORM) is not LoanA
+        assert registry_a.get_dumper(ActiveLoan, _RegLoanORM) is not LoanB
+        assert registry_b.get_dumper(ActiveLoan, _RegLoanORM) is not LoanA
 
         # ...and nothing leaked into the default registry.
-        assert StateMapper.__registry__.get(ActiveLoan, _RegLoanORM) is None
+        assert Dumper.__registry__.get_dumper(ActiveLoan, _RegLoanORM) is None
 
     def test_base_mappers_share_registry_via_attribute(self) -> None:
         registry_a = MapperRegistry()
         registry_b = MapperRegistry()
 
-        class BaseA(StateMapper[_R, _T], registry=registry_a): ...
-        class BaseB(StateMapper[_R, _T], registry=registry_b): ...
+        class BaseA(Dumper[_R, _T], registry=registry_a): ...
+        class BaseB(Dumper[_R, _T], registry=registry_b): ...
 
         class LoanA(BaseA[ActiveLoan, _RegLoanORM]): ...
         class LoanB(BaseB[ActiveLoan, _RegLoanORM]): ...
@@ -77,14 +77,14 @@ class TestIndependentRegistries:
         assert LoanB.__registry__ is registry_b
 
     def test_nested_resolution_is_scoped_to_own_registry(self) -> None:
-        """A debt mapper resolves sub-mappers only within its own registry."""
+        """A debt dumper resolves sub-dumpers only within its own registry."""
         registry_a = MapperRegistry()
         registry_b = MapperRegistry()
 
-        class BaseA(StateMapper[_R, _T], registry=registry_a): ...
-        class BaseB(StateMapper[_R, _T], registry=registry_b): ...
+        class BaseA(Dumper[_R, _T], registry=registry_a): ...
+        class BaseB(Dumper[_R, _T], registry=registry_b): ...
 
-        # The loan mapper lives in registry B, the debt mapper in registry A.
+        # The loan dumper lives in registry B, the debt dumper in registry A.
         class _LoanB(BaseB[ActiveLoan, _RegLoanORM]): ...
         class _DebtA(BaseA[ActiveDebt, _RegDebtORM]): ...
 
@@ -92,18 +92,23 @@ class TestIndependentRegistries:
             loans=(ActiveLoan(id=1, postponement_date=datetime(2026, 1, 1)),)
         )
 
-        # _DebtA cannot see the loan mapper registered in registry B.
+        # _DebtA cannot see the loan dumper registered in registry B.
         with pytest.raises(MapperRegistryError, match="ActiveLoan"):
-            _DebtA.to_orm(debt)
+            _DebtA.dump(debt)
 
     def test_nested_round_trip_within_a_single_registry(self) -> None:
         registry = MapperRegistry()
 
-        class MyBase(StateMapper[_R, _T], registry=registry): ...
+        class _Dump(Dumper[_R, _T], registry=registry): ...
+        class _Load(Loader[_R, _T], registry=registry): ...
 
-        class _LoanActive(MyBase[ActiveLoan, _RegLoanORM]): ...
-        class _LoanClosed(MyBase[ClosedLoan, _RegLoanORM]): ...
-        class _Debt(MyBase[ActiveDebt, _RegDebtORM]): ...
+        class _LoanActiveDump(_Dump[ActiveLoan, _RegLoanORM]): ...
+        class _LoanClosedDump(_Dump[ClosedLoan, _RegLoanORM]): ...
+        class _DebtDump(_Dump[ActiveDebt, _RegDebtORM]): ...
+
+        class _LoanActiveLoad(_Load[ActiveLoan, _RegLoanORM]): ...
+        class _LoanClosedLoad(_Load[ClosedLoan, _RegLoanORM]): ...
+        class _DebtLoad(_Load[ActiveDebt, _RegDebtORM]): ...
 
         debt = ActiveDebt(
             loans=(
@@ -112,7 +117,7 @@ class TestIndependentRegistries:
             )
         )
 
-        result = _Debt.to_state(_Debt.to_orm(debt))
+        result = _DebtLoad.load(_DebtDump.dump(debt))
 
         assert result == debt
 
@@ -122,14 +127,14 @@ class TestClearRegistry:
         registry_a = MapperRegistry()
         registry_b = MapperRegistry()
 
-        class BaseA(StateMapper[_R, _T], registry=registry_a): ...
-        class BaseB(StateMapper[_R, _T], registry=registry_b): ...
+        class BaseA(Dumper[_R, _T], registry=registry_a): ...
+        class BaseB(Dumper[_R, _T], registry=registry_b): ...
 
         class LoanA(BaseA[ActiveLoan, _RegLoanORM]): ...
         class LoanB(BaseB[ActiveLoan, _RegLoanORM]): ...
 
         BaseA.clear_registry()
 
-        assert registry_a.get(ActiveLoan, _RegLoanORM) is None
+        assert registry_a.get_dumper(ActiveLoan, _RegLoanORM) is None
         # Clearing one base mapper's registry leaves the others untouched.
-        assert registry_b.get(ActiveLoan, _RegLoanORM) is LoanB
+        assert registry_b.get_dumper(ActiveLoan, _RegLoanORM) is LoanB

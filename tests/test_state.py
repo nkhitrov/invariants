@@ -4,8 +4,6 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-
-from invariants.mappers import FieldRef
 from invariants.state import State, Statefull, is_root_state, is_root_child, is_base_state
 from tests.support.states import ActivateLoan, ActiveLoan, OverdueLoan, LoanState
 
@@ -160,27 +158,3 @@ class TestStateMachineExecute:
         assert isinstance(result, ActiveLoan)
         assert result.id == 1
         assert result.postponement_date == datetime(2024, 6, 1)
-
-
-class TestClassLevelFieldAccess:
-    def test_returns_field_ref(self) -> None:
-        ref = ActiveLoan.id
-        assert isinstance(ref, FieldRef)
-        assert ref.state_cls is ActiveLoan
-        assert ref.name == "id"
-
-    def test_instance_access_returns_value(self) -> None:
-        inst = ActiveLoan(id=42, postponement_date=datetime(2026, 1, 1))
-        assert inst.id == 42
-        assert inst.status == "active"
-
-    def test_unknown_field_raises(self) -> None:
-        with pytest.raises(AttributeError):
-            ActiveLoan.nonexistent_field
-
-    def test_dunder_attrs_unaffected(self) -> None:
-        assert ActiveLoan.__name__ == "ActiveLoan"
-
-    def test_annotation_accessible(self) -> None:
-        ref: FieldRef = ActiveLoan.postponement_date  # type: ignore[assignment]
-        assert ref.annotation is datetime

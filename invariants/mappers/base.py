@@ -6,7 +6,6 @@ from typing import Any, ClassVar, Generic, TypeVar, cast
 from polyfactory.exceptions import ConfigurationException
 from polyfactory.utils.predicates import is_type_var
 from pydantic import ValidationError
-from sqlalchemy.orm import InstrumentedAttribute
 from typing_extensions import get_args, get_origin, get_original_bases
 
 from invariants.mappers._introspect import (
@@ -15,7 +14,6 @@ from invariants.mappers._introspect import (
     get_relationship_element_type,
     unwrap_collection_state_types,
 )
-from invariants.mappers._refs import FieldRef
 from invariants.state import State
 
 R = TypeVar("R", bound=State)
@@ -23,7 +21,7 @@ T = TypeVar("T")
 
 
 class MapperConfigurationError(ConfigurationException):
-    """Raised when a StateMapper subclass is misconfigured."""
+    """Raised when a Dumper/Loader subclass is misconfigured."""
 
 
 class MapperRegistryError(LookupError):
@@ -31,56 +29,81 @@ class MapperRegistryError(LookupError):
 
 
 class MapperRegistry:
-    """A self-contained collection of :class:`StateMapper` subclasses.
+    """A self-contained collection of :class:`Dumper` and :class:`Loader` subclasses.
 
-    Mappers are keyed by their ``(state, ORM)`` pair. Each base mapper owns one
-    registry, and concrete mappers register into the registry of their base.
-    This mirrors SQLAlchemy's ``MetaData``: independent registries let unrelated
-    mapper hierarchies coexist without clashing — useful, for instance, to isolate
-    mappers between tests.
+    Mappers are keyed by their ``(state, ORM)`` pair, in two separate tables for the
+    two directions. Each base mapper owns one registry, and concrete mappers register
+    into the registry of their base. This mirrors SQLAlchemy's ``MetaData``: independent
+    registries let unrelated mapper hierarchies coexist without clashing — useful, for
+    instance, to isolate mappers between tests.
     """
 
     def __init__(self) -> None:
-        self._mappers: dict[
-            tuple[type[Any], type[Any]], type["StateMapper[Any, Any]"]
-        ] = {}
+        self._dumpers: dict[tuple[type[Any], type[Any]], type["Dumper[Any, Any]"]] = {}
+        self._loaders: dict[tuple[type[Any], type[Any]], type["Loader[Any, Any]"]] = {}
 
-    def register(
-        self,
-        state_cls: type[Any],
-        orm_cls: type[Any],
-        mapper: type["StateMapper[Any, Any]"],
+    def register_dumper(
+        self, state_cls: type[Any], orm_cls: type[Any], mapper: type["Dumper[Any, Any]"]
     ) -> None:
-        self._mappers[(state_cls, orm_cls)] = mapper
+        self._dumpers[(state_cls, orm_cls)] = mapper
 
-    def get(
+    def register_loader(
+        self, state_cls: type[Any], orm_cls: type[Any], mapper: type["Loader[Any, Any]"]
+    ) -> None:
+        self._loaders[(state_cls, orm_cls)] = mapper
+
+    def get_dumper(
         self, state_cls: type[Any], orm_cls: type[Any]
-    ) -> type["StateMapper[Any, Any]"] | None:
-        return self._mappers.get((state_cls, orm_cls))
+    ) -> type["Dumper[Any, Any]"] | None:
+        return self._dumpers.get((state_cls, orm_cls))
+
+    def get_loader(
+        self, state_cls: type[Any], orm_cls: type[Any]
+    ) -> type["Loader[Any, Any]"] | None:
+        return self._loaders.get((state_cls, orm_cls))
 
     def clear(self) -> None:
-        """Remove all registered mappers."""
-        self._mappers.clear()
+        """Remove all registered dumpers and loaders."""
+        self._dumpers.clear()
+        self._loaders.clear()
 
 
-class StateMapper(Generic[R, T]):
-    __is_base_mapper__: ClassVar[bool] = True
-    __registry__: ClassVar[MapperRegistry] = MapperRegistry()
+_default_registry = MapperRegistry()
+
+
+class Mapper(Generic[R, T]):
+    """Abstract base for directional state<->ORM mappers.
+
+    Subclass :class:`Dumper` (State -> ORM) or :class:`Loader` (ORM -> State), not this
+    class directly. Holds the machinery common to both directions: generic-argument
+    inference, validation, the registry, and per-field handler collection.
+    """
+
+    __registry__: ClassVar[MapperRegistry] = _default_registry
     __state_model__: ClassVar[type[Any]]
     __sql_model__: ClassVar[type[Any]]
-    _to_orm_handlers: ClassVar[dict[str, Callable[[Any], Any]]] = {}
-    _to_state_handlers: ClassVar[dict[str, Callable[[Any], Any]]] = {}
+    _handlers: ClassVar[dict[str, Callable[[Any], Any]]] = {}
+    _handler_marker: ClassVar[str]
+    _wrong_marker: ClassVar[str]
 
     def __init_subclass__(
-        cls, registry: MapperRegistry | None = None, **kwargs: Any
+        cls,
+        registry: MapperRegistry | None = None,
+        abstract: bool = False,
+        **kwargs: Any,
     ) -> None:
         super().__init_subclass__(**kwargs)
 
+        if abstract:
+            # A directional base (Dumper/Loader) or a user-declared abstract base.
+            if registry is not None:
+                cls.__registry__ = registry
+            return
+
         if registry is not None:
-            # Declaring a new base mapper that owns its own registry; concrete
-            # mappers subclassing it will register into this registry.
+            # A user base mapper that owns its own registry; concrete mappers
+            # subclassing it will register into this registry.
             cls.__registry__ = registry
-            cls.__is_base_mapper__ = True
             return
 
         state_cls = getattr(cls, "__state_model__", None) or cls._infer_state_type()
@@ -88,7 +111,7 @@ class StateMapper(Generic[R, T]):
 
         if state_cls is None or orm_cls is None:
             raise MapperConfigurationError(
-                f"StateMapper subclass {cls.__name__} requires both state and ORM generic arguments"
+                f"{cls.__name__} requires both state and ORM generic arguments"
             )
 
         if issubclass(state_cls, State) and state_cls.has_statefull_fields():
@@ -99,16 +122,19 @@ class StateMapper(Generic[R, T]):
 
         if orm_cls.__dict__.get("__abstract__", False):
             raise MapperConfigurationError(
-                f"'{orm_cls.__name__}' is an abstract model and cannot be used as '__sql_model__' on {cls.__name__}"
+                f"'{orm_cls.__name__}' is an abstract model and cannot be used as "
+                f"'__sql_model__' on {cls.__name__}"
             )
 
-        cls.__is_base_mapper__ = False
         cls.__state_model__ = state_cls
         cls.__sql_model__ = orm_cls
-        cls._to_orm_handlers = dict(cls._to_orm_handlers)
-        cls._to_state_handlers = dict(cls._to_state_handlers)
+        cls._handlers = dict(cls._handlers)
         cls._collect_field_handlers()
-        cls.__registry__.register(state_cls, orm_cls, cls)
+        cls._register()
+
+    @classmethod
+    def _register(cls) -> None:
+        raise NotImplementedError
 
     @classmethod
     def clear_registry(cls) -> None:
@@ -121,46 +147,42 @@ class StateMapper(Generic[R, T]):
         orm_rels = get_orm_relationships(cls.__sql_model__)
         state_fields = cls.__state_model__.model_fields
 
-        for val in cls.__dict__.values():
+        for name, val in cls.__dict__.items():
             fn = val.__func__ if isinstance(val, (classmethod, staticmethod)) else val
             if not callable(fn):
                 continue
-            bound = (
-                val.__get__(None, cls)
-                if isinstance(val, (classmethod, staticmethod))
-                else fn
+            if getattr(fn, cls._wrong_marker, False):
+                raise MapperConfigurationError(
+                    f"{cls.__name__}: method '{name}' uses the wrong direction decorator "
+                    f"for a {cls.__bases__[0].__name__}"
+                )
+            if getattr(fn, cls._handler_marker, False):
+                bound = (
+                    val.__get__(None, cls)
+                    if isinstance(val, (classmethod, staticmethod))
+                    else fn
+                )
+                cls._validate_handler_field(name, state_fields, orm_cols, orm_rels)
+                cls._handlers[name] = bound
+
+    @classmethod
+    def _validate_handler_field(
+        cls,
+        field: str,
+        state_fields: dict[str, Any],
+        orm_cols: dict[str, Any],
+        orm_rels: dict[str, Any],
+    ) -> None:
+        if field not in state_fields:
+            raise MapperConfigurationError(
+                f"{cls.__name__}: State model "
+                f"{cls.__state_model__.__name__} has no field '{field}'"
             )
-            field_ref = getattr(fn, "_mapper_field_to_orm", None)
-            if isinstance(field_ref, FieldRef):
-                if not issubclass(cls.__state_model__, field_ref.state_cls):
-                    raise MapperConfigurationError(
-                        f"@field_to_orm on {cls.__name__}: field reference "
-                        f"{field_ref.state_cls.__name__}.{field_ref.name} does not belong to "
-                        f"{cls.__state_model__.__name__}"
-                    )
-                if field_ref.name not in orm_cols and field_ref.name not in orm_rels:
-                    raise MapperConfigurationError(
-                        f"@field_to_orm on {cls.__name__}: ORM model "
-                        f"{cls.__sql_model__.__name__} has no attribute '{field_ref.name}'"
-                    )
-                cls._to_orm_handlers[field_ref.name] = bound
-            orm_attr = getattr(fn, "_mapper_field_to_state", None)
-            if isinstance(orm_attr, InstrumentedAttribute):
-                attr_owner = cast("type[Any]", orm_attr.class_)
-                if attr_owner is not cls.__sql_model__ and not issubclass(
-                    cls.__sql_model__, attr_owner
-                ):
-                    raise MapperConfigurationError(
-                        f"@field_to_state on {cls.__name__}: ORM attribute "
-                        f"{attr_owner.__name__}.{orm_attr.key} does not belong to "
-                        f"{cls.__sql_model__.__name__}"
-                    )
-                if orm_attr.key not in state_fields:
-                    raise MapperConfigurationError(
-                        f"@field_to_state on {cls.__name__}: State model "
-                        f"{cls.__state_model__.__name__} has no field '{orm_attr.key}'"
-                    )
-                cls._to_state_handlers[orm_attr.key] = bound
+        if field not in orm_cols and field not in orm_rels:
+            raise MapperConfigurationError(
+                f"{cls.__name__}: ORM model "
+                f"{cls.__sql_model__.__name__} has no attribute '{field}'"
+            )
 
     @classmethod
     def _infer_state_type(cls) -> type[R] | None:
@@ -175,7 +197,7 @@ class StateMapper(Generic[R, T]):
         mapper_bases: Iterable[type[Any]] = (
             b
             for b in get_original_bases(cls)
-            if get_origin(b) and issubclass(get_origin(b), StateMapper)
+            if get_origin(b) and issubclass(get_origin(b), Mapper)
         )
         generic_args: Sequence[Any] = [
             arg
@@ -187,15 +209,26 @@ class StateMapper(Generic[R, T]):
             return None
         return generic_args[index]
 
+
+class Dumper(Mapper[R, T], abstract=True):
+    """Converts a State instance into an ORM instance."""
+
+    _handler_marker = "_mapper_dump"
+    _wrong_marker = "_mapper_load"
+
     @classmethod
-    def to_orm(cls, state: R) -> T:
+    def _register(cls) -> None:
+        cls.__registry__.register_dumper(cls.__state_model__, cls.__sql_model__, cls)
+
+    @classmethod
+    def dump(cls, state: R) -> T:
         cols = get_orm_columns(cls.__sql_model__)
         rels = get_orm_relationships(cls.__sql_model__)
         payload: dict[str, Any] = {}
 
         for fname in type(state).model_fields:
             value = getattr(state, fname)
-            handler = cls._to_orm_handlers.get(fname)
+            handler = cls._handlers.get(fname)
             if handler is not None:
                 payload[fname] = handler(value)
                 continue
@@ -205,12 +238,13 @@ class StateMapper(Generic[R, T]):
                 elem_orm_cls = get_relationship_element_type(rels[fname])
                 mapped: list[Any] = []
                 for item in value:
-                    sub = cls.__registry__.get(type(item), elem_orm_cls)
+                    sub = cls.__registry__.get_dumper(type(item), elem_orm_cls)
                     if sub is None:
                         raise MapperRegistryError(
-                            f"No mapper registered for ({type(item).__name__}, {elem_orm_cls.__name__})"
+                            f"No dumper registered for "
+                            f"({type(item).__name__}, {elem_orm_cls.__name__})"
                         )
-                    mapped.append(sub.to_orm(item))
+                    mapped.append(sub.dump(item))
                 payload[fname] = mapped
             else:
                 raise MapperRegistryError(
@@ -220,14 +254,25 @@ class StateMapper(Generic[R, T]):
 
         return cast("T", cls.__sql_model__(**payload))
 
+
+class Loader(Mapper[R, T], abstract=True):
+    """Converts an ORM instance into a State instance."""
+
+    _handler_marker = "_mapper_load"
+    _wrong_marker = "_mapper_dump"
+
     @classmethod
-    def to_state(cls, orm: T) -> R:
+    def _register(cls) -> None:
+        cls.__registry__.register_loader(cls.__state_model__, cls.__sql_model__, cls)
+
+    @classmethod
+    def load(cls, orm: T) -> R:
         cols = get_orm_columns(cls.__sql_model__)
         rels = get_orm_relationships(cls.__sql_model__)
         data: dict[str, Any] = {}
 
         for fname, finfo in cls.__state_model__.model_fields.items():
-            handler = cls._to_state_handlers.get(fname)
+            handler = cls._handlers.get(fname)
             if handler is not None:
                 data[fname] = handler(getattr(orm, fname))
                 continue
@@ -265,11 +310,11 @@ def _build_state_variant(
 ) -> Any:
     last_err: ValidationError | None = None
     for variant in variants:
-        sub = registry.get(variant, elem_orm_cls)
+        sub = registry.get_loader(variant, elem_orm_cls)
         if sub is None:
             continue
         try:
-            return sub.to_state(orm_item)
+            return sub.load(orm_item)
         except ValidationError as exc:
             last_err = exc
     raise MapperRegistryError(
