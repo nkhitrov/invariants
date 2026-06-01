@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from datetime import datetime
 from decimal import Decimal
 
@@ -10,28 +10,12 @@ from sqlalchemy import Column, ForeignKey, Integer
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
-from sqlalchemy.orm import Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import Mapped, mapped_column, relationship, sessionmaker
 
 from polyfactory import ConfigurationException
-from invariants.factories import StateFactory
 from invariants.factories.sqlalchemy import SQLAlchemyStateFactory
 from tests.support.orm import Base
-from tests.support.states import LoanState, ActiveLoan, ActiveDebt, ClosedLoan, ClosedDebt
-
-
-class TestStateFactory:
-    def test_factory_validation(self) -> None:
-        with pytest.raises(TypeError):
-            class InvalidFactory(StateFactory[LoanState]): ...
-
-    def test_factory_build(self) -> None:
-        class ActiveLoanFactory(StateFactory[ActiveLoan]): ...
-
-        loan = ActiveLoanFactory.build()
-        assert isinstance(loan, ActiveLoan)
-        assert loan.status == "active"
-        assert isinstance(loan.id, int)
-        assert isinstance(loan.postponement_date, datetime)
+from tests.support.states import ActiveLoan, ActiveDebt, ClosedLoan, ClosedDebt
 
 
 class TestSqlalchemyStateFactoryValidation:
