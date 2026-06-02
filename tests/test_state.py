@@ -4,7 +4,6 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-
 from invariants.state import State, Statefull, is_root_state, is_root_child, is_base_state
 from tests.support.states import ActivateLoan, ActiveLoan, OverdueLoan, LoanState
 

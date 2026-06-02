@@ -65,12 +65,13 @@ class StateMeta(ModelMetaclass):
 
     def _validate_typing_any_override(cls, base: type) -> None:
         invalid_fields = []
-        model_fields = getattr(base, "model_fields", {})
-        for field_name, field_info in model_fields.items():
+        base_fields = getattr(base, "model_fields", {})
+        cls_fields = getattr(cls, "model_fields", {})
+        for field_name, field_info in base_fields.items():
             if (
                 field_info.annotation is Statefull
-                and field_name in cls.model_fields  # type: ignore[attr-defined]
-                and cls.model_fields[field_name].annotation is Statefull  # type: ignore[attr-defined]
+                and field_name in cls_fields
+                and cls_fields[field_name].annotation is Statefull
             ):
                 invalid_fields.append(field_name)
 
