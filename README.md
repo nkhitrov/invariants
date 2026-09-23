@@ -155,13 +155,14 @@ Both `StateFactory` and `SQLAlchemyStateFactory` are thin wrappers over [polyfac
 Generate [XState v5](https://stately.ai/docs/xstate) state machine code from your `StateMachine` subclasses:
 
 ```bash
-# Print generated JS
+# Print generated JS — paste it into https://sketch.stately.ai
 python -m invariants.viz print examples.debt
 
-# Start interactive visualizer
+# Start a local Stately Sketch with one document per state machine
+# (clones https://github.com/statelyai/sketch on first run; needs Node.js with pnpm or npx)
 python -m invariants.viz serve examples.debt
 ```
 
-And open visualisation in browser
+`serve` opens each machine in the browser
 
 ![img.png](docs/img.png)

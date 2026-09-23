@@ -32,7 +32,7 @@ make check
 # XState: print generated JS code
 uv run python -m invariants.viz print examples.example
 
-# XState: start visualizer (auto-clones nkhitrov/xstate-display, requires yarn/node)
+# XState: start visualizer (auto-clones statelyai/sketch, requires node + pnpm or npx)
 uv run python -m invariants.viz serve examples.example
 ```
 
@@ -59,13 +59,14 @@ Class hierarchy: `State` (root) → root child (declares `Statefull` fields) →
 
 ### XState Visualization: `invariants/viz/xstate.py`
 
-Generates XState v5 JS code from `StateMachine` subclasses for use with stately.ai/viz.
+Generates XState v5 JS code from `StateMachine` subclasses for use with
+[Stately Sketch](https://sketch.stately.ai) ([statelyai/sketch](https://github.com/statelyai/sketch)).
 
 - **Transition extraction** — Parses `execute(self, input: StateA) -> StateB` signatures to discover valid transitions. Union types (`StateA | StateB`) produce multiple transitions.
 - **Nesting detection** — Scans concrete state field annotations to find parent→child state hierarchy relationships (e.g., `DebtState` containing `LoanState` tuples).
-- **Guard generation** — Derives guards from field annotations: `ContainsOne(X)` → `"anyX"`, `tuple[X, ...]` → `"onlyX"`, combined → named compound guard using `and()`.
-- **Code rendering** — Outputs `setup({ guards }).createMachine()` or plain `createMachine()` depending on whether guards are present. Compound guards are registered by name in `setup()` (not inline) for visualizer compatibility.
-- **CLI** — `python -m invariants.viz {print,serve} <module>`. The `serve` command auto-clones [nkhitrov/xstate-display](https://github.com/nkhitrov/xstate-display) into `.xstate-viz/` and starts a dev server with the generated code pre-filled.
+- **Guard generation** — Derives guards from field annotations: `ContainsOne(X)` → `"anyX"`, `tuple[X, ...]` → `"onlyX"`, combined → `and([...])` over those names.
+- **Code rendering** — `build_xstate_config` produces one config per root state; `render_configs` turns configs into JS, `render_xstate_code` is the two together. Output is `setup({ guards }).createMachine()` when a machine has guards, plain `createMachine()` otherwise. Leaf guards are registered as `() => true` stubs in `setup()`; compound guards are inlined with the xstate combinator (`guard: and(['a', 'b'])`).
+- **CLI** — `python -m invariants.viz {print,serve} <module>`. `serve` auto-clones [statelyai/sketch](https://github.com/statelyai/sketch) into `invariants/.sketch/` (gitignored), starts its dev server with `VITE_REGISTRY_API_URL` pointed at Sketch's own local sqlite API (so no Stately account is involved, `DB_PATH=:memory:`), stores **one document per root machine** through `POST /api/viz/create-source-file` (Sketch renders only the first machine of a document) and opens each `/viz/<id>` in the browser. The Node/browser half (`_ensure_sketch`, `serve`) is `# pragma: no cover`; the URL/env/payload helpers are unit-tested in `tests/test_viz/test_xstate/test_sketch.py`.
 
 ## Workflow
 

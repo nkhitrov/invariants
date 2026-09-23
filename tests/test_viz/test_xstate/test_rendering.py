@@ -1,6 +1,8 @@
 from invariants.viz.xstate import (
     _render_state_config,
     _render_transition_object,
+    build_xstate_config,
+    render_configs,
     render_xstate_code,
 )
 from tests.support.states import (
@@ -44,9 +46,12 @@ class TestRenderXstateCodeWithGuards:
                     MakeLoanOverdue, CloseLoan, ActivateLoan]
         code = render_xstate_code(machines)
         assert "guard: 'onlyClosedLoan'" in code
-        assert "guard: 'anyOverdueLoanAndonlyOverdueLoanOrActiveLoanOrClosedLoan'" in code
-        # Compound guard defined in setup using and()
-        assert "anyOverdueLoanAndonlyOverdueLoanOrActiveLoanOrClosedLoan: and(['anyOverdueLoan', 'onlyOverdueLoanOrActiveLoanOrClosedLoan'])" in code
+        # Compound guard is inlined with the xstate combinator ...
+        assert "guard: and(['anyOverdueLoan', 'onlyOverdueLoanOrActiveLoanOrClosedLoan'])" in code
+        # ... and only its leaves are registered in setup()
+        assert "anyOverdueLoan: () => true," in code
+        assert "onlyOverdueLoanOrActiveLoanOrClosedLoan: () => true," in code
+        assert "Andonly" not in code
 
     def test_setup_with_guards(self) -> None:
         machines = [CloseDebt, MakeDebtOverdue, ChangeOverdueDebtToActive,
@@ -67,19 +72,17 @@ class TestRenderXstateCodeWithGuards:
         assert "setup(" not in code
 
     def test_simple_guards_only_uses_setup(self) -> None:
-        """Config with only simple guards (no compound) should still use setup().
-
-        Kills or→and mutation on `if guard_names or compound_guards`.
-        """
+        """Config with only simple guards (no compound) should still use setup()."""
         # CloseDebt targets ClosedDebt which has only simple guard "onlyClosedLoan"
         # By using only CloseDebt (no MakeDebtOverdue which creates compound guards),
-        # we get a config with only simple_guard_names and empty compound_guards.
+        # we get a config with simple guard names and no combinators.
         machines = [CloseDebt, CloseLoan, ActivateLoan, MakeLoanOverdue]
         code = render_xstate_code(machines)
         # DebtState should use setup() because it has simple guards
         assert "setup({" in code
         assert "onlyClosedLoan: () => true," in code
         assert "}).createMachine({" in code
+        assert "import { setup, createMachine } from 'xstate';" in code
 
     def test_no_nested_states_in_output(self) -> None:
         machines = [CloseDebt, MakeDebtOverdue, ChangeOverdueDebtToActive,
@@ -135,10 +138,40 @@ class TestRenderXstateCodeExactFormat:
         assert "const debtState = " in code
 
 
+class TestRenderConfigs:
+    machines = [CloseDebt, MakeDebtOverdue, ChangeOverdueDebtToActive,
+                MakeLoanOverdue, CloseLoan, ActivateLoan]
+
+    def test_render_xstate_code_is_render_configs_of_build(self) -> None:
+        configs = build_xstate_config(self.machines)
+        assert render_xstate_code(self.machines) == render_configs(configs)
+
+    def test_single_config_renders_only_that_machine(self) -> None:
+        """A visualizer that shows one machine per document gets one machine per render."""
+        configs = build_xstate_config(self.machines)
+        loan_code = render_configs({"LoanState": configs["LoanState"]})
+        assert "id: 'LoanState'," in loan_code
+        assert "DebtState" not in loan_code
+        # Guards belong to DebtState only, so this document needs no setup()/and
+        assert loan_code.split("\n")[0] == "import { createMachine } from 'xstate';"
+
+    def test_single_config_keeps_its_guards(self) -> None:
+        """Splitting by root must not lose guards derived from cross-root nesting."""
+        configs = build_xstate_config(self.machines)
+        debt_code = render_configs({"DebtState": configs["DebtState"]})
+        assert debt_code.split("\n")[0] == "import { setup, createMachine, and } from 'xstate';"
+        assert "guard: 'onlyClosedLoan'" in debt_code
+        assert "LoanState" not in debt_code
+
+
 class TestRenderTransitionObject:
     def test_with_guard(self) -> None:
         result = _render_transition_object({"target": "X", "guard": "g"})
         assert result == "{ target: 'X', guard: 'g' }"
+
+    def test_with_compound_guard(self) -> None:
+        result = _render_transition_object({"target": "X", "guard": {"type": "and", "guards": ["g", "h"]}})
+        assert result == "{ target: 'X', guard: and(['g', 'h']) }"
 
     def test_without_guard(self) -> None:
         result = _render_transition_object({"target": "X"})
