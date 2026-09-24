@@ -4,9 +4,11 @@ import argparse
 import importlib
 import inspect
 import json
+import shutil
 import sys
 import types
 import typing
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -459,11 +461,15 @@ def build_xstate_config(machines: Sequence[type]) -> dict[str, dict[str, Any]]:
 
 
 def _render_guard(guard: str | dict[str, Any]) -> str:
-    """Render a guard value as JS code (always a named string reference)."""
+    """Render a guard value as JS code.
+
+    A leaf guard is a named reference into ``setup({ guards })``; a compound guard is
+    the xstate combinator applied inline, e.g. ``and(['a', 'b'])``.
+    """
     if isinstance(guard, str):
         return f"'{guard}'"
-    # Compound guards are registered by name in setup()
-    return f"'{_compound_guard_name(guard)}'"
+    inner = ", ".join(_render_guard(g) for g in guard["guards"])
+    return f"{guard['type']}([{inner}])"
 
 
 def _render_transition_object(item: dict[str, Any]) -> str:
@@ -506,22 +512,14 @@ def _render_state_config(state_name: str, state_config: dict[str, Any], indent: 
     return "\n".join(lines)
 
 
-def _compound_guard_name(guard: dict[str, Any]) -> str:
-    """Generate a descriptive name for a compound guard."""
-    parts = guard["guards"]
-    return "And".join(parts)
-
-
-def _collect_guard_info(config: dict[str, Any]) -> tuple[set[str], dict[str, dict[str, Any]], set[str]]:
+def _collect_guard_info(config: dict[str, Any]) -> tuple[set[str], set[str]]:
     """Collect guard info from a config.
 
-    Returns (simple_guard_names, compound_guards, guard_fns) where:
-    - simple_guard_names: leaf guard strings
-    - compound_guards: name → compound guard dict (for setup definition)
-    - guard_fns: higher-level combinator names like 'and', 'or'
+    Returns (guard_names, guard_fns) where:
+    - guard_names: leaf guard names, to be registered in setup({ guards })
+    - guard_fns: combinator names like 'and', 'or', to be imported from xstate
     """
     guard_names: set[str] = set()
-    compound_guards: dict[str, dict[str, Any]] = {}
     guard_fns: set[str] = set()
 
     def _visit_guard(g: str | dict[str, Any]) -> None:
@@ -529,8 +527,6 @@ def _collect_guard_info(config: dict[str, Any]) -> tuple[set[str], dict[str, dic
             guard_names.add(g)
         elif isinstance(g, dict) and "type" in g:
             guard_fns.add(g["type"])
-            name = _compound_guard_name(g)
-            compound_guards[name] = g
             for child in g.get("guards", []):
                 _visit_guard(child)
 
@@ -541,47 +537,46 @@ def _collect_guard_info(config: dict[str, Any]) -> tuple[set[str], dict[str, dic
                 if isinstance(item, dict) and "guard" in item:
                     _visit_guard(item["guard"])
 
-    return guard_names, compound_guards, guard_fns
+    return guard_names, guard_fns
 
 
 def render_xstate_code(machines: Sequence[type]) -> str:
-    """Generate xstate v5 JS code with setup() + createMachine() calls.
+    """Generate xstate v5 JS code for every root machine found in ``machines``.
 
-    The output can be pasted directly into stately.ai/viz.
+    The output can be pasted directly into https://sketch.stately.ai.
     """
-    configs = build_xstate_config(machines)
+    return render_configs(build_xstate_config(machines))
 
+
+def render_configs(configs: dict[str, dict[str, Any]]) -> str:
+    """Render xstate v5 JS code for the given configs (see ``build_xstate_config``).
+
+    Rendering a single-entry dict yields a document with one machine, which is what a
+    visualizer that shows one machine per document needs.
+    """
     # Collect all guard functions across all configs for the import
     all_guard_fns: set[str] = set()
-    config_guards: dict[str, tuple[set[str], dict[str, dict[str, Any]], set[str]]] = {}
-    has_any_guards = False
+    config_guards: dict[str, set[str]] = {}
     for name, config in configs.items():
-        guard_names, compound_guards, guard_fns = _collect_guard_info(config)
-        config_guards[name] = (guard_names, compound_guards, guard_fns)
+        guard_names, guard_fns = _collect_guard_info(config)
+        config_guards[name] = guard_names
         all_guard_fns |= guard_fns
-        if guard_names or compound_guards:
-            has_any_guards = True
 
-    imports = ["setup"] if has_any_guards else []
+    imports = ["setup"] if any(config_guards.values()) else []
     imports.append("createMachine")
     imports.extend(sorted(all_guard_fns))
     parts: list[str] = [f"import {{ {', '.join(imports)} }} from 'xstate';", ""]
 
     for name, config in configs.items():
         var_name = name[0].lower() + name[1:]
-        guard_names, compound_guards, _ = config_guards[name]
+        guard_names = config_guards[name]
 
-        if guard_names or compound_guards:
+        if guard_names:
             # Use setup({ guards }).createMachine() pattern
             parts.append(f"const {var_name} = setup({{")
             parts.append("  guards: {")
             for gname in sorted(guard_names):
                 parts.append(f"    {gname}: () => true,")
-            for cname in sorted(compound_guards):
-                cg = compound_guards[cname]
-                guard_type = cg["type"]
-                guards_list = ", ".join(f"'{g}'" for g in cg["guards"])
-                parts.append(f"    {cname}: {guard_type}([{guards_list}]),")
             parts.append("  },")
             parts.append("}).createMachine({")
         else:
@@ -600,70 +595,91 @@ def render_xstate_code(machines: Sequence[type]) -> str:
     return "\n".join(parts)
 
 
-_XSTATE_VIZ_DIR_NAME = ".xstate-viz"
+_SKETCH_DIR_NAME = ".sketch"
+_SKETCH_REPO_URL = "https://github.com/statelyai/sketch.git"
+# Matches the `packageManager` field of statelyai/sketch; used when pnpm is not on PATH.
+_PNPM_VERSION = "10.32.1"
 
 
-def _get_viz_dir() -> Path:  # pragma: no cover
-    """Get the xstate-viz directory (git submodule in project root)."""
-    return Path(__file__).resolve().parent.parent / _XSTATE_VIZ_DIR_NAME
+def _sketch_api_url(port: int) -> str:
+    """Base URL of Sketch's local source-file API (a sqlite-backed stand-in for the Stately registry)."""
+    return f"http://127.0.0.1:{port}/api/viz"
 
 
-def _ensure_xstate_viz() -> Path:  # pragma: no cover
-    """Ensure xstate-display is cloned and has node_modules installed. Returns the path."""
-    viz_dir = _get_viz_dir()
-
-    if not viz_dir.exists() or not (viz_dir / "package.json").exists():
-        import subprocess
-
-        print("Cloning xstate-display ...")
-        subprocess.run(
-            ["git", "clone", "https://github.com/nkhitrov/xstate-display.git", str(viz_dir)],
-            check=True,
-        )
-
-    if not (viz_dir / "node_modules").exists():
-        import shutil
-        import subprocess
-
-        for cmd in ("yarn", "node"):
-            if shutil.which(cmd) is None:
-                print(f"Error: '{cmd}' is required but not found in PATH", file=sys.stderr)
-                sys.exit(1)
-
-        print("Installing xstate-viz dependencies (yarn install) ...")
-        subprocess.run(
-            ["yarn", "install", "--frozen-lockfile", "--ignore-engines"],
-            cwd=viz_dir,
-            check=True,
-        )
-
-    return viz_dir
+def _sketch_viz_url(port: int, file_id: str) -> str:
+    """URL that opens a stored source file in Sketch."""
+    return f"http://127.0.0.1:{port}/viz/{file_id}"
 
 
-def _build_ssr_url(xstate_code: str, port: int) -> str:  # pragma: no cover
-    """Build the xstate-viz URL with ?ssr= param containing the machine code."""
-    from urllib.parse import quote
+def _sketch_env(port: int, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for the Sketch dev server.
 
-    ssr_payload = {
-        "data": {
-            "id": "invariants",
-            "text": xstate_code,
-            "updatedAt": "2024-01-01T00:00:00Z",
-            "youHaveLiked": False,
-            "likesCount": 0,
-            "project": {
-                "id": "invariants",
-                "name": "Invariants",
-                "owner": {
-                    "id": "invariants",
-                    "displayName": "Invariants",
-                    "avatarUrl": "",
-                },
-            },
-        }
+    ``VITE_REGISTRY_API_URL`` points the browser app at the local API instead of
+    stately.ai, so no account is needed; ``DB_PATH=:memory:`` keeps the sqlite store
+    in memory so nothing is written next to the checkout.
+    """
+    return {
+        **(base if base is not None else {}),
+        "VITE_REGISTRY_API_URL": _sketch_api_url(port),
+        "DB_PATH": ":memory:",
     }
-    encoded = quote(json.dumps(ssr_payload))
-    return f"http://localhost:{port}/viz/invariants?ssr={encoded}"
+
+
+def _pnpm_command() -> list[str]:
+    """Return the command prefix that runs pnpm: the binary itself, or ``npx pnpm@<version>``."""
+    if shutil.which("pnpm"):
+        return ["pnpm"]
+    if shutil.which("npx"):
+        return ["npx", "--yes", f"pnpm@{_PNPM_VERSION}"]
+    print("Error: 'pnpm' or 'npx' (Node.js) is required but not found in PATH", file=sys.stderr)
+    sys.exit(1)
+
+
+def _create_source_file(port: int, *, name: str, code: str) -> str:
+    """Store ``code`` in the running Sketch instance and return the file id to open."""
+    payload = json.dumps({"text": code, "name": name, "format": "xstate"}).encode()
+    request = urllib.request.Request(
+        f"{_sketch_api_url(port)}/create-source-file",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = json.loads(response.read().decode())
+    file_id = body.get("data", {}).get("id")
+    if not isinstance(file_id, str) or not file_id:
+        raise RuntimeError(f"Sketch create-source-file returned no id: {body!r}")
+    return file_id
+
+
+def _get_sketch_dir() -> Path:  # pragma: no cover
+    """Directory the Sketch checkout lives in (gitignored, cloned on first `serve`)."""
+    return Path(__file__).resolve().parent.parent / _SKETCH_DIR_NAME
+
+
+def _ensure_sketch() -> Path:  # pragma: no cover
+    """Ensure statelyai/sketch is cloned and has node_modules installed. Returns the path."""
+    import subprocess
+
+    sketch_dir = _get_sketch_dir()
+
+    if not (sketch_dir / "package.json").exists():
+        print("Cloning statelyai/sketch ...")
+        subprocess.run(
+            ["git", "clone", "--depth", "1", _SKETCH_REPO_URL, str(sketch_dir)],
+            check=True,
+        )
+
+    if not (sketch_dir / "node_modules").exists():
+        pnpm = _pnpm_command()
+        print("Installing Sketch dependencies (pnpm install) ...")
+        subprocess.run(
+            [*pnpm, "install", "--frozen-lockfile"],
+            cwd=sketch_dir,
+            check=True,
+        )
+
+    return sketch_dir
 
 
 def _check_port_free(port: int) -> None:  # pragma: no cover
@@ -682,8 +698,23 @@ def _check_port_free(port: int) -> None:  # pragma: no cover
             sys.exit(1)
 
 
+def _create_source_file_with_retry(port: int, *, name: str, code: str, attempts: int = 30) -> str:  # pragma: no cover
+    """The dev server accepts connections before its API routes are ready; retry briefly."""
+    import time
+    from urllib.error import URLError
+
+    for attempt in range(attempts):
+        try:
+            return _create_source_file(port, name=name, code=code)
+        except (URLError, ConnectionError, TimeoutError):
+            if attempt == attempts - 1:
+                raise
+            time.sleep(1)
+    raise AssertionError("unreachable")
+
+
 def serve(module_path: str, port: int = 3000) -> None:  # pragma: no cover
-    """Start xstate-viz dev server with pre-filled machine code from a Python module."""
+    """Start a local Sketch (statelyai/sketch) with one document per machine from a Python module."""
     import atexit
     import os
     import signal
@@ -705,24 +736,18 @@ def serve(module_path: str, port: int = 3000) -> None:  # pragma: no cover
 
     _check_port_free(port)
 
-    xstate_code = render_xstate_code(machines)
+    configs = build_xstate_config(machines)
     print(f"Found {len(machines)} machine(s): {', '.join(m.__name__ for m in machines)}")
+    print(f"Root state(s): {', '.join(configs)}")
 
-    viz_dir = _ensure_xstate_viz()
+    sketch_dir = _ensure_sketch()
+    pnpm = _pnpm_command()
 
-    url = _build_ssr_url(xstate_code, port)
-
-    env = {
-        **os.environ,
-        "PORT": str(port),
-        "NODE_OPTIONS": "--openssl-legacy-provider",
-    }
-    print(f"Starting xstate-viz on http://localhost:{port} ...")
-
+    print(f"Starting Sketch on http://127.0.0.1:{port} ...")
     proc = subprocess.Popen(
-        ["npx", "next", "-p", str(port)],
-        cwd=viz_dir,
-        env=env,
+        [*pnpm, "dev", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=sketch_dir,
+        env=_sketch_env(port, base=dict(os.environ)),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         # Create a new process group so we can kill the entire tree
@@ -751,7 +776,7 @@ def serve(module_path: str, port: int = 3000) -> None:  # pragma: no cover
         ret = proc.poll()
         if ret is not None:
             stderr = proc.stderr.read().decode() if proc.stderr else ""
-            print(f"Error: xstate-viz exited with code {ret}", file=sys.stderr)
+            print(f"Error: Sketch exited with code {ret}", file=sys.stderr)
             if stderr:
                 print(stderr[:500], file=sys.stderr)
             sys.exit(1)
@@ -761,16 +786,26 @@ def serve(module_path: str, port: int = 3000) -> None:  # pragma: no cover
         except OSError:
             time.sleep(1)
     else:
-        print("Warning: server may not be ready yet, opening browser anyway")
+        print("Error: Sketch did not start listening in time", file=sys.stderr)
+        _cleanup()
+        sys.exit(1)
+
+    # Sketch shows one machine per document, so store each root machine separately.
+    urls: list[str] = []
+    for name, config in configs.items():
+        file_id = _create_source_file_with_retry(port, name=name, code=render_configs({name: config}))
+        urls.append(_sketch_viz_url(port, file_id))
+        print(f"  {name}: {urls[-1]}")
 
     print("Opening browser...")
-    webbrowser.open(url)
+    for url in urls:
+        webbrowser.open(url)
     print("Press Ctrl+C to stop")
 
     try:
         proc.wait()
     except KeyboardInterrupt:
-        print("\nStopping xstate-viz...")
+        print("\nStopping Sketch...")
         _cleanup()
         proc.wait(timeout=5)
         print("Stopped")
