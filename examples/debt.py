@@ -22,7 +22,7 @@ from examples.loan import (
 
 
 class DebtState(State):
-    """Долг. Состояния аналогичны займу, но определяются состояниями входящих в него займов."""
+    """Debt. Its states mirror the loan states but are determined by the states of the loans it contains."""
 
     id: int
     status: Statefull
@@ -30,21 +30,21 @@ class DebtState(State):
 
 
 class ActiveDebt(DebtState):
-    """Активный долг — все займы активны или закрыты, но хотя бы один активен."""
+    """Active debt: every loan is active or closed, and at least one is active."""
 
     status: Literal["active"] = "active"
     loans: Annotated[tuple[ActiveLoan | ClosedLoan, ...], ContainsOne(ActiveLoan)]
 
 
 class ClosedDebt(DebtState):
-    """Закрытый долг — все займы закрыты."""
+    """Closed debt: every loan is closed."""
 
     status: Literal["closed"] = "closed"
     loans: tuple[ClosedLoan, ...]
 
 
 class OverdueDebt(DebtState):
-    """Просроченный долг — хотя бы один заем просрочен."""
+    """Overdue debt: at least one loan is overdue."""
 
     status: Literal["overdue"] = "overdue"
     loans: Annotated[
@@ -83,7 +83,7 @@ class OverdueDebtClosedEvent(Event[OverdueDebt, ClosedDebt]):
 
 
 class CreateDebtOperation(Operation[DebtState]):
-    """Создание нового долга — всегда начинается как активный, с одним выданным займом."""
+    """Create a debt: it always starts active, with one issued loan."""
 
     issue_loan: IssueLoanOperation
 
@@ -96,7 +96,7 @@ class CreateDebtOperation(Operation[DebtState]):
 
 
 class AddLoanToDebtOperation(Operation[DebtState]):
-    """Новый займ в активном долге: инвариант долга сохранился, события долга нет (петля)."""
+    """Add a loan to an active debt: the debt's invariant holds, so there is no debt event (a loop)."""
 
     issue_loan: IssueLoanOperation
 
@@ -109,7 +109,7 @@ class AddLoanToDebtOperation(Operation[DebtState]):
 
 
 class MakeDebtOverdueOperation(Operation[DebtState]):
-    """Перевод активного долга в просрочку — один из займов становится просроченным."""
+    """Make an active debt overdue: one of its loans becomes overdue."""
 
     make_loan_overdue: MakeLoanOverdueOperation
 
@@ -137,7 +137,7 @@ class MakeDebtOverdueOperation(Operation[DebtState]):
 
 
 class ActivateDebtLoanOperation(Operation[DebtState]):
-    """Отсрочка по просроченному займу: долг становится активным, если просроченных займов не осталось."""
+    """Postpone an overdue loan: the debt becomes active once no overdue loans are left."""
 
     activate_loan: ActivateLoanOperation
 
@@ -171,7 +171,7 @@ class ActivateDebtLoanOperation(Operation[DebtState]):
 
 
 class CloseDebtOperation(Operation[DebtState]):
-    """Закрытие долга — все незакрытые займы закрываются."""
+    """Close a debt: every loan that is not closed yet gets closed."""
 
     close_loan: CloseLoanOperation
 
@@ -209,7 +209,7 @@ class CloseDebtOperation(Operation[DebtState]):
 
 
 class CheckDebtOverdueDaysQuery(Query[DebtState]):
-    """Подсчёт дней просрочки по первому просроченному займу."""
+    """Count overdue days by the first overdue loan."""
 
     def execute(self, debt: OverdueDebt, *, now: datetime) -> int:
         overdue = next(loan for loan in debt.loans if isinstance(loan, OverdueLoan))

@@ -6,7 +6,7 @@ from invariants.state import State, Statefull
 
 
 class LoanState(State):
-    """Заем. Состояния: активный (ожидает оплаты), просроченный (наступил deadline), закрытый (оплачен)."""
+    """Loan. States: active (awaiting payment), overdue (the deadline has passed), closed (paid)."""
 
     id: int
     status: Statefull
@@ -19,7 +19,7 @@ class ActiveLoan(LoanState):
 
 
 class ClosedLoan(LoanState):
-    """Закрытый заем. Не может изменить состояние — остается закрытым навсегда."""
+    """Closed loan. It cannot change state: it stays closed forever."""
 
     status: Literal["closed"] = "closed"
     postponement_date: None = None
@@ -51,7 +51,7 @@ class OverdueLoanClosedEvent(Event[OverdueLoan, ClosedLoan]):
 
 
 class IssueLoanOperation(Operation[LoanState]):
-    """Выдача займа — займ появляется активным."""
+    """Issue a loan: the loan starts active."""
 
     def execute(
         self, *, loan_id: int, postponement_date: datetime
@@ -61,7 +61,7 @@ class IssueLoanOperation(Operation[LoanState]):
 
 
 class MakeLoanOverdueOperation(Operation[LoanState]):
-    """Перевод активного займа в просрочку."""
+    """Make an active loan overdue."""
 
     def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]:
         overdue = OverdueLoan(id=loan.id, postponement_date=loan.postponement_date)
@@ -69,7 +69,7 @@ class MakeLoanOverdueOperation(Operation[LoanState]):
 
 
 class ActivateLoanOperation(Operation[LoanState]):
-    """Возврат просроченного займа в активное состояние (при получении отсрочки)."""
+    """Return an overdue loan to the active state (when a postponement is granted)."""
 
     def execute(
         self, loan: OverdueLoan, *, postponement_date: datetime
@@ -79,7 +79,7 @@ class ActivateLoanOperation(Operation[LoanState]):
 
 
 class CloseLoanOperation(Operation[LoanState]):
-    """Закрытие займа: у каждого исходного состояния своё ребро и своё событие."""
+    """Close a loan: each source state has its own edge and its own event."""
 
     @overload
     def execute(self, loan: ActiveLoan) -> Transition[ClosedLoan, ActiveLoanClosedEvent]: ...
