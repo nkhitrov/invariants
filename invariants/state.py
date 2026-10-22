@@ -105,5 +105,8 @@ class State(BaseModel, metaclass=StateMeta):
 
 T = TypeVar("T")
 
+
 class StateMachine(Generic[T]):
     """Abstract class for state controllers."""
+
+    __slots__ = ()

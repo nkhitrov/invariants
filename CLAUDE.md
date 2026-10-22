@@ -44,9 +44,26 @@ uv run python -m invariants.viz serve examples.example
 - **`StateMeta`** — Metaclass extending Pydantic's `ModelMetaclass`. Enforces at class creation: child states cannot add new fields, and must override all `Statefull` fields with concrete types.
 - **`State`** — Base class (`BaseModel` + `StateMeta`). Frozen, strict. A `model_validator(mode="before")` prevents instantiation if the class still has `Statefull` fields.
 
-- **`StateMachine[T]`** — Generic abstract base for commands/queries over a state hierarchy `T`. The `execute` method's type signature (`input → output`) defines valid state transitions.
+- **`StateMachine[T]`** — Generic abstract base (`__slots__ = ()`) for commands/queries over a state hierarchy `T`. Legacy form: the `execute` signature (`input → output`) defines valid state transitions. New code uses `Operation`/`Query` below.
 
 Class hierarchy: `State` (root) → root child (declares `Statefull` fields) → concrete state (overrides all `Statefull` fields). The metaclass validation triggers on the concrete level (`is_base_state` check).
+
+### Hierarchy introspection: `invariants/hierarchy.py`
+
+Shared by operations and viz: `get_root_state` (the `T` of `StateMachine[T]`), `get_concrete_states`, `is_concrete_state`, `unwrap_state_types`, `find_state_root`, `detect_nesting`/`NestingRelation`, `get_nested_roots` (transitive roots nested in a root's fields). `invariants/viz/xstate.py` re-exports them.
+
+### Operations: `invariants/operations.py`
+
+DDD-style transitions: **edge of the state graph = event**, and every edge has one event and one operation. States have no methods; behaviour lives in `...Operation` classes.
+
+- **`Event[From, To]`** — frozen strict pydantic model, name ends with `Event`. `From`/`To` are single concrete states of one root (generic metadata, not fields — payload is only user fields); `From = None` is the null state (creation); `Event[A, A]` is forbidden. `get_event_edge(cls)` returns `(From, To)` (also through generic user bases).
+- **`EdgeRegistry`** — like `MapperRegistry`: `(From, To)` → event class and → operation class. Default registry on `Event`/`Operation`; pass `registry=EdgeRegistry()` in the class definition to isolate (tests do this for every ad-hoc event/operation).
+- **`Transition[S, E]`** — generic `NamedTuple` (`state`, `events: tuple[E, ...]`), covariant; no methods. mypy infers `E` from the declared return type, except when `execute` returns a *union* of `Transition`s — then annotate a local variable (see `ActivateDebtLoanOperation`).
+- **`OperationMeta`** — `dataclass_transform` metaclass; in `__new__` turns each subclass into `dataclass(frozen=True, kw_only=True, slots=True)` (that creates a new class — hence a metaclass, and the recreated class is detected by `__dataclass_fields__` in its namespace) and then calls `validate_operation`.
+- **`Operation[T]`** (`T` = root state) — validated at class creation: name ends with `Operation`; dataclass fields (dependencies) are only `Operation`/`Query` (time and external data are `execute` arguments); each `execute` signature (each `typing.get_overloads` entry, else `execute` itself) has at most one positional parameter — a single concrete source state of `T` (none = creation from `None`) — other parameters keyword-only, and returns `Transition[B, E]` or a union of them. For `A ≠ B`, `E` holds exactly one event of root `T`, and it is `Event[A, B]`; a loop `A → A` holds no root events, only nested ones. Other events must belong to roots nested in `T` (`get_nested_roots`). An edge is declared once per operation and owned by one operation per registry. `get_operation_edges(cls)` returns the parsed `OperationEdge`s. `execute` is wrapped at runtime (signature/annotations/overloads preserved) to raise `TransitionError` if the result isn't a declared `Transition`, carries undeclared events, or doesn't emit the edge event exactly once (a loop must emit at least one event).
+- **`Query[T]`** — same dataclass/dependency rules, `execute` is free-form (e.g. returns `int`).
+
+`examples/loan.py` and `examples/debt.py` are the reference: creation (`IssueLoanOperation`), overloads (`CloseLoanOperation`), nested aggregate (`MakeDebtOverdueOperation` calls `MakeLoanOverdueOperation`), loop (`AddLoanToDebtOperation`), data-dependent union (`ActivateDebtLoanOperation`).
 
 ### Validators: `invariants/conditions.py`
 
@@ -62,7 +79,7 @@ Class hierarchy: `State` (root) → root child (declares `Statefull` fields) →
 Generates XState v5 JS code from `StateMachine` subclasses for use with
 [Stately Sketch](https://sketch.stately.ai) ([statelyai/sketch](https://github.com/statelyai/sketch)).
 
-- **Transition extraction** — Parses `execute(self, input: StateA) -> StateB` signatures to discover valid transitions. Union types (`StateA | StateB`) produce multiple transitions.
+- **Transition extraction** — For operations (`execute` returns `Transition[...]`) uses `get_operation_edges`: one transition per edge, named after the edge event (a loop — after the operation); an edge from `None` sets the machine's `initial` instead of becoming an `on` entry. Legacy `execute(self, input: StateA) -> StateB` signatures are still parsed; union types (`StateA | StateB`) produce multiple transitions named after the machine.
 - **Nesting detection** — Scans concrete state field annotations to find parent→child state hierarchy relationships (e.g., `DebtState` containing `LoanState` tuples).
 - **Guard generation** — Derives guards from field annotations: `ContainsOne(X)` → `"anyX"`, `tuple[X, ...]` → `"onlyX"`, combined → `and([...])` over those names.
 - **Code rendering** — `build_xstate_config` produces one config per root state; `render_configs` turns configs into JS, `render_xstate_code` is the two together. Output is `setup({ guards }).createMachine()` when a machine has guards, plain `createMachine()` otherwise. Leaf guards are registered as `() => true` stubs in `setup()`; compound guards are inlined with the xstate combinator (`guard: and(['a', 'b'])`).
@@ -77,7 +94,8 @@ Generates XState v5 JS code from `StateMachine` subclasses for use with
 ## Testing
 
 - pytest with pytest-asyncio (auto mode).
-- `tests/support/` contains shared fixtures: example state hierarchies (`LoanState`, `DebtState` and their children) and SQLAlchemy ORM base.
+- `tests/support/` contains shared fixtures: example state hierarchies (`LoanState`, `DebtState` and their children, with legacy `StateMachine`s used by the viz tests) and SQLAlchemy ORM base.
+- Operation tests (`tests/test_operations/`) use the states/events of `examples/`; every event or operation defined inside a test passes `registry=EdgeRegistry()` so edges don't clash.
 - Uses `dirty-equals` for flexible assertions.
 - SQLAlchemy tests use in-memory SQLite with aiosqlite for async tests.
 - Factory tests reset `BaseFactory._factory_type_mapping` between runs via fixture.
