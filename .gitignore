@@ -215,3 +215,5 @@ mutation-report.html
 
 # Claude files
 .claude/
+# Local notes
+todo.md
