@@ -1,24 +1,29 @@
 import dataclasses
-from datetime import datetime
-from typing import Any, cast, overload
+from datetime import date
+from decimal import Decimal
+from typing import Any, Never, cast, overload
 
 import pytest
 
-from examples.debt import ActiveDebt, DebtBecameOverdueEvent, DebtCreatedEvent, DebtState, OverdueDebt
+from examples.debt import ActiveDebt, DebtBecameOverdueEvent, DebtOpenedEvent, DebtState, OverdueDebt
 from examples.loan import (
+    AccruePenaltyOperation,
     ActiveLoan,
     ActiveLoanClosedEvent,
+    CancelLoanOverdueOperation,
     CloseLoanOperation,
     ClosedLoan,
+    Installment,
     IssueLoanOperation,
-    LoanActivatedEvent,
     LoanBecameOverdueEvent,
     LoanIssuedEvent,
+    LoanOverdueCancelledEvent,
     LoanState,
-    MakeLoanOverdueOperation,
     OverdueLoan,
     OverdueLoanClosedEvent,
+    RecalculateLoanTermsOperation,
 )
+from examples.payment import PaymentReceivedEvent
 from invariants.operations import (
     EdgeRegistry,
     Operation,
@@ -29,65 +34,69 @@ from invariants.operations import (
     get_operation_edges,
 )
 
-DATE = datetime(2026, 1, 1)
+DAY = date(2026, 1, 1)
+SCHEDULE = (Installment(postponement_date=date(2026, 1, 31), amount=Decimal(1000)),)
 
 
 def active_loan(loan_id: int = 1) -> ActiveLoan:
-    return ActiveLoan(id=loan_id, postponement_date=DATE)
+    return ActiveLoan(id=loan_id, financed_amount=Decimal(1000), booking_date=DAY, schedule=SCHEDULE)
 
 
 def overdue_loan(loan_id: int = 1) -> OverdueLoan:
-    return OverdueLoan(id=loan_id, postponement_date=DATE)
+    return OverdueLoan(id=loan_id, financed_amount=Decimal(1000), booking_date=DAY, schedule=SCHEDULE)
+
+
+def closed_loan(loan_id: int = 1) -> ClosedLoan:
+    return ClosedLoan(id=loan_id, financed_amount=Decimal(1000), booking_date=DAY, schedule=SCHEDULE)
 
 
 class TestDataclass:
     def test_dependencies_are_keyword_only_fields(self) -> None:
         class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
-            make_overdue: MakeLoanOverdueOperation
+            accrue: AccruePenaltyOperation
 
-            def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]:
-                return self.make_overdue.execute(loan)
+            def execute(self, loan: OverdueLoan) -> Transition[OverdueLoan, Never]:
+                return self.accrue.execute(loan, booking_date=DAY)
 
-        dependency = MakeLoanOverdueOperation()
-        operation = FirstOperation(make_overdue=dependency)
-        assert operation.make_overdue is dependency
-        assert [field.name for field in dataclasses.fields(operation)] == ["make_overdue"]
+        dependency = AccruePenaltyOperation()
+        operation = FirstOperation(accrue=dependency)
+        assert operation.accrue is dependency
+        assert [field.name for field in dataclasses.fields(operation)] == ["accrue"]
         with pytest.raises(TypeError):
             FirstOperation(dependency)  # type: ignore[misc]
 
     def test_operation_is_frozen(self) -> None:
         class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
-            make_overdue: MakeLoanOverdueOperation
+            accrue: AccruePenaltyOperation
 
-            def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]:
-                return self.make_overdue.execute(loan)
+            def execute(self, loan: OverdueLoan) -> Transition[OverdueLoan, Never]:
+                return self.accrue.execute(loan, booking_date=DAY)
 
-        operation = FirstOperation(make_overdue=MakeLoanOverdueOperation())
+        operation = FirstOperation(accrue=AccruePenaltyOperation())
         with pytest.raises(dataclasses.FrozenInstanceError):
-            operation.make_overdue = MakeLoanOverdueOperation()  # type: ignore[misc]
+            operation.accrue = AccruePenaltyOperation()  # type: ignore[misc]
 
     def test_operation_is_slotted(self) -> None:
-        operation = MakeLoanOverdueOperation()
-        assert not hasattr(operation, "__dict__")
+        assert not hasattr(AccruePenaltyOperation(), "__dict__")
 
     def test_query_is_dataclass(self) -> None:
-        class CountQuery(Query[LoanState]):
+        class LoanIdQuery(Query[LoanState]):
             close_loan: CloseLoanOperation
 
             def execute(self, loan: ActiveLoan) -> int:
                 return loan.id
 
-        query = CountQuery(close_loan=CloseLoanOperation())
+        query = LoanIdQuery(close_loan=CloseLoanOperation())
         assert query.execute(active_loan(7)) == 7
         assert not hasattr(query, "__dict__")
 
     def test_dependencies_must_be_operations(self) -> None:
-        with pytest.raises(TypeError, match="dependencies must be operations or queries, got datetime"):
+        with pytest.raises(TypeError, match="dependencies must be operations or queries, got date"):
 
             class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
-                now: datetime
+                today: date
 
-                def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]: ...
+                def execute(self, loan: OverdueLoan) -> Transition[OverdueLoan, Never]: ...
 
     def test_query_dependencies_must_be_operations(self) -> None:
         with pytest.raises(TypeError, match="dependencies must be operations or queries"):
@@ -133,7 +142,7 @@ class TestSignatureValidation:
         with pytest.raises(TypeError, match="must be keyword-only"):
 
             class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
-                def execute(self, loan: ActiveLoan, at: datetime) -> Transition[OverdueLoan, LoanBecameOverdueEvent]: ...
+                def execute(self, loan: ActiveLoan, at: date) -> Transition[OverdueLoan, LoanBecameOverdueEvent]: ...
 
     def test_must_return_transition(self) -> None:
         with pytest.raises(TypeError, match="must return Transition"):
@@ -154,22 +163,25 @@ class TestSignatureValidation:
                 def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, int]: ...  # type: ignore[type-var]
 
     def test_edge_requires_event(self) -> None:
-        with pytest.raises(TypeError, match="edge ActiveDebt → OverdueDebt has no event"):
-
-            class FirstOperation(Operation[DebtState], registry=EdgeRegistry()):
-                def execute(self, debt: ActiveDebt) -> Transition[OverdueDebt, LoanBecameOverdueEvent]: ...
-
-    def test_edge_event_must_match_edge(self) -> None:
-        with pytest.raises(TypeError, match="LoanActivatedEvent is the event of OverdueLoan → ActiveLoan, not of ActiveLoan → OverdueLoan"):
+        with pytest.raises(TypeError, match="edge ActiveLoan → OverdueLoan has no event"):
 
             class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
-                def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanActivatedEvent]: ...
+                def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, Never]: ...
+
+    def test_edge_event_must_match_edge(self) -> None:
+        with pytest.raises(
+            TypeError,
+            match="LoanOverdueCancelledEvent is the event of OverdueLoan → ActiveLoan, not of ActiveLoan → OverdueLoan",
+        ):
+
+            class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
+                def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanOverdueCancelledEvent]: ...
 
     def test_creation_edge_event_must_start_from_none(self) -> None:
         with pytest.raises(TypeError, match="is the event of OverdueLoan → ActiveLoan, not of None → ActiveLoan"):
 
             class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
-                def execute(self, *, loan_id: int) -> Transition[ActiveLoan, LoanActivatedEvent]: ...
+                def execute(self, *, loan_id: int) -> Transition[ActiveLoan, LoanOverdueCancelledEvent]: ...
 
     def test_edge_emits_one_root_event(self) -> None:
         with pytest.raises(TypeError, match="must emit one event of DebtState"):
@@ -177,21 +189,15 @@ class TestSignatureValidation:
             class FirstOperation(Operation[DebtState], registry=EdgeRegistry()):
                 def execute(
                     self, debt: ActiveDebt
-                ) -> Transition[OverdueDebt, DebtBecameOverdueEvent | DebtCreatedEvent]: ...
+                ) -> Transition[OverdueDebt, DebtBecameOverdueEvent | DebtOpenedEvent]: ...
 
     def test_events_only_from_nested_roots(self) -> None:
-        with pytest.raises(TypeError, match="DebtCreatedEvent belongs to a hierarchy not nested in LoanState"):
+        with pytest.raises(TypeError, match="DebtOpenedEvent belongs to a hierarchy not nested in LoanState"):
 
             class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
                 def execute(
                     self, loan: ActiveLoan
-                ) -> Transition[OverdueLoan, LoanBecameOverdueEvent | DebtCreatedEvent]: ...
-
-    def test_loop_without_root_event(self) -> None:
-        with pytest.raises(TypeError, match="loop ActiveLoan → ActiveLoan must not emit events of LoanState"):
-
-            class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
-                def execute(self, loan: ActiveLoan) -> Transition[ActiveLoan, LoanIssuedEvent]: ...
+                ) -> Transition[OverdueLoan, LoanBecameOverdueEvent | DebtOpenedEvent]: ...
 
     def test_overloads_declare_each_edge_once(self) -> None:
         with pytest.raises(TypeError, match="edge ActiveLoan → ClosedLoan is declared twice"):
@@ -203,18 +209,123 @@ class TestSignatureValidation:
                 def execute(self, loan: ActiveLoan, *, force: bool) -> Transition[ClosedLoan, ActiveLoanClosedEvent]: ...
                 def execute(self, loan: ActiveLoan, *, force: bool = False) -> Transition[ClosedLoan, ActiveLoanClosedEvent]: ...
 
-    def test_edge_belongs_to_one_operation(self) -> None:
+
+class TestLoops:
+    def test_loop_without_events(self) -> None:
+        registry = EdgeRegistry()
+
+        class FirstOperation(Operation[LoanState], registry=registry):
+            def execute(self, loan: ActiveLoan) -> Transition[ActiveLoan, Never]:
+                return Transition(loan, ())
+
+        assert get_operation_edges(FirstOperation) == [OperationEdge(ActiveLoan, ActiveLoan, None, ())]
+        assert FirstOperation().execute(active_loan()) == (active_loan(), ())
+
+    def test_loop_has_no_root_event(self) -> None:
+        with pytest.raises(TypeError, match="loop ActiveLoan → ActiveLoan must not emit events of LoanState"):
+
+            class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
+                def execute(self, loan: ActiveLoan) -> Transition[ActiveLoan, LoanIssuedEvent]: ...
+
+    def test_loop_is_not_an_owned_edge(self) -> None:
+        registry = EdgeRegistry()
+
+        class FirstOperation(Operation[LoanState], registry=registry):
+            def execute(self, loan: ActiveLoan) -> Transition[ActiveLoan, Never]:
+                return Transition(loan, ())
+
+        class SecondOperation(Operation[LoanState], registry=registry):
+            def execute(self, loan: ActiveLoan, *, booking_date: date) -> Transition[ActiveLoan, Never]:
+                return Transition(loan, ())
+
+        assert registry.get_operation((ActiveLoan, ActiveLoan)) is None
+        assert SecondOperation().execute(active_loan(), booking_date=DAY).events == ()
+
+    def test_loop_with_delegated_nested_events(self) -> None:
+        class FirstOperation(Operation[DebtState], registry=EdgeRegistry()):
+            recalculate: RecalculateLoanTermsOperation
+
+            def execute(self, debt: OverdueDebt) -> Transition[OverdueDebt, LoanBecameOverdueEvent]:
+                return Transition(debt, ())
+
+        debt = OverdueDebt(id=1, loans=(overdue_loan(),))
+        assert FirstOperation(recalculate=RecalculateLoanTermsOperation()).execute(debt) == (debt, ())
+
+
+class TestOwnershipAndDelegation:
+    def test_edge_has_one_owner(self) -> None:
         registry = EdgeRegistry()
 
         class FirstOperation(Operation[LoanState], registry=registry):
             def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]: ...
 
-        with pytest.raises(TypeError, match="ActiveLoan → OverdueLoan is already implemented by operation FirstOperation"):
+        with pytest.raises(
+            TypeError,
+            match="edge ActiveLoan → OverdueLoan is already owned by operation FirstOperation; delegate to it",
+        ):
 
             class SecondOperation(Operation[LoanState], registry=registry):
                 def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]: ...
 
         assert registry.get_operation((ActiveLoan, OverdueLoan)) is FirstOperation
+
+    def test_delegating_operation_does_not_own_the_edge(self) -> None:
+        registry = EdgeRegistry()
+
+        class OwnerOperation(Operation[LoanState], registry=registry):
+            def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]:
+                return Transition(overdue_loan(loan.id), (LoanBecameOverdueEvent(loan_id=loan.id),))
+
+        class DelegatingOperation(Operation[LoanState], registry=registry):
+            owner: OwnerOperation
+
+            def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]:
+                return self.owner.execute(loan)
+
+        assert registry.get_operation((ActiveLoan, OverdueLoan)) is OwnerOperation
+        result = DelegatingOperation(owner=OwnerOperation()).execute(active_loan())
+        assert result.events == (LoanBecameOverdueEvent(loan_id=1),)
+
+    def test_delegation_is_transitive(self) -> None:
+        registry = EdgeRegistry()
+
+        class OwnerOperation(Operation[LoanState], registry=registry):
+            def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]: ...
+
+        class MiddleQuery(Query[LoanState]):
+            owner: OwnerOperation
+
+            def execute(self, loan: ActiveLoan) -> int: ...
+
+        class TopOperation(Operation[LoanState], registry=registry):
+            middle: MiddleQuery
+
+            def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]: ...
+
+        assert registry.get_operation((ActiveLoan, OverdueLoan)) is OwnerOperation
+        assert get_operation_edges(TopOperation)[0].event is LoanBecameOverdueEvent
+
+    def test_nested_event_requires_delegation(self) -> None:
+        with pytest.raises(
+            TypeError,
+            match="PaymentReceivedEvent is the event of None → ReceivedPayment, which no dependency implements",
+        ):
+
+            class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
+                def execute(self, loan: ActiveLoan) -> Transition[ActiveLoan, PaymentReceivedEvent]: ...
+
+    def test_nested_event_of_nested_dependency(self) -> None:
+        class FirstOperation(Operation[DebtState], registry=EdgeRegistry()):
+            issue_loan: IssueLoanOperation
+
+            def execute(self, *, debt_id: int) -> Transition[ActiveDebt, DebtOpenedEvent | LoanIssuedEvent]:
+                loan, events = self.issue_loan.execute(
+                    loan_id=1, financed_amount=Decimal(1000), booking_date=DAY, schedule=SCHEDULE
+                )
+                return Transition(ActiveDebt(id=debt_id, loans=(loan,)), (DebtOpenedEvent(debt_id=debt_id), *events))
+
+        debt, events = FirstOperation(issue_loan=IssueLoanOperation()).execute(debt_id=1)
+        assert events == (DebtOpenedEvent(debt_id=1), LoanIssuedEvent(loan_id=1))
 
     def test_failed_operation_registers_no_edge(self) -> None:
         registry = EdgeRegistry()
@@ -233,7 +344,7 @@ class TestSignatureValidation:
         registry = EdgeRegistry()
         registry.register_operation((ActiveLoan, ClosedLoan), CloseLoanOperation)
         with pytest.raises(TypeError, match="already implemented by operation CloseLoanOperation"):
-            registry.register_operation((ActiveLoan, ClosedLoan), MakeLoanOverdueOperation)
+            registry.register_operation((ActiveLoan, ClosedLoan), CancelLoanOverdueOperation)
 
     def test_registry_clear(self) -> None:
         registry = EdgeRegistry()
@@ -243,6 +354,10 @@ class TestSignatureValidation:
 
         registry.clear()
         assert registry.get_operation((ActiveLoan, OverdueLoan)) is None
+
+    def test_default_registry_holds_example_owners(self) -> None:
+        assert Operation.__registry__.get_operation((ActiveLoan, ClosedLoan)) is CloseLoanOperation
+        assert Operation.__registry__.get_operation((OverdueLoan, ActiveLoan)) is CancelLoanOverdueOperation
 
 
 class TestOperationEdges:
@@ -257,20 +372,18 @@ class TestOperationEdges:
             OperationEdge(None, ActiveLoan, LoanIssuedEvent, (LoanIssuedEvent,)),
         ]
 
-    def test_default_registry_holds_example_edges(self) -> None:
-        assert Operation.__registry__.get_operation((ActiveLoan, ClosedLoan)) is CloseLoanOperation
+    def test_union_with_loop(self) -> None:
+        assert get_operation_edges(RecalculateLoanTermsOperation) == [
+            OperationEdge(ActiveLoan, OverdueLoan, LoanBecameOverdueEvent, (LoanBecameOverdueEvent,)),
+            OperationEdge(ActiveLoan, ActiveLoan, None, ()),
+        ]
 
 
 class TestRuntimeChecks:
-    def test_returns_transition(self) -> None:
-        loan, events = MakeLoanOverdueOperation().execute(active_loan())
-        assert loan == overdue_loan()
-        assert events == (LoanBecameOverdueEvent(loan_id=1),)
-
     def test_state_passed_by_keyword(self) -> None:
-        loan, events = CloseLoanOperation().execute(loan=overdue_loan())
-        assert loan == ClosedLoan(id=1)
-        assert events == (OverdueLoanClosedEvent(loan_id=1),)
+        loan, events = AccruePenaltyOperation().execute(loan=overdue_loan(), booking_date=date(2026, 2, 1))
+        assert loan.booking_date == date(2026, 2, 1)
+        assert events == ()
 
     def test_not_a_transition(self) -> None:
         class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
@@ -283,7 +396,7 @@ class TestRuntimeChecks:
     def test_undeclared_target(self) -> None:
         class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
             def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]:
-                return cast(Transition[OverdueLoan, LoanBecameOverdueEvent], Transition(ClosedLoan(id=1), ()))
+                return cast(Transition[OverdueLoan, LoanBecameOverdueEvent], Transition(closed_loan(), ()))
 
         with pytest.raises(TransitionError, match="edge ActiveLoan → ClosedLoan is not declared"):
             FirstOperation().execute(active_loan())
@@ -312,6 +425,14 @@ class TestRuntimeChecks:
         with pytest.raises(TransitionError, match="LoanIssuedEvent is not declared for edge ActiveLoan → OverdueLoan"):
             FirstOperation().execute(active_loan())
 
+    def test_undeclared_event_in_loop(self) -> None:
+        class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
+            def execute(self, loan: ActiveLoan) -> Transition[ActiveLoan, Never]:
+                return Transition(loan, cast(Any, (LoanIssuedEvent(loan_id=1),)))
+
+        with pytest.raises(TransitionError, match="LoanIssuedEvent is not declared for edge ActiveLoan → ActiveLoan"):
+            FirstOperation().execute(active_loan())
+
     def test_edge_event_missing(self) -> None:
         class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):
             def execute(self, loan: ActiveLoan) -> Transition[OverdueLoan, LoanBecameOverdueEvent]:
@@ -328,15 +449,6 @@ class TestRuntimeChecks:
 
         with pytest.raises(TransitionError, match="exactly once, got 2"):
             FirstOperation().execute(active_loan())
-
-    def test_loop_without_events(self) -> None:
-        class FirstOperation(Operation[DebtState], registry=EdgeRegistry()):
-            def execute(self, debt: ActiveDebt) -> Transition[ActiveDebt, LoanIssuedEvent]:
-                return Transition(debt, ())
-
-        debt = ActiveDebt(id=1, loans=(active_loan(),))
-        with pytest.raises(TransitionError, match="loop ActiveDebt → ActiveDebt must emit at least one event"):
-            FirstOperation().execute(debt)
 
     def test_creation_checked(self) -> None:
         class FirstOperation(Operation[LoanState], registry=EdgeRegistry()):

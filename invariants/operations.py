@@ -1,11 +1,17 @@
 """Operations over state hierarchies: edges of the state graph, their events and results.
 
-* :class:`Event` ``[From, To]`` names exactly one edge of the graph; ``From = None`` is the
-  null state (creation). An edge has at most one event.
+An event is a change of the business state, i.e. of the state *class*, not of field values.
+
+* :class:`Event` ``[From, To]`` names exactly one edge ``From → To`` (``From ≠ To``) of the
+  graph; ``From = None`` is the null state (creation). An edge has at most one event.
 * :class:`Transition` ``[S, E]`` is the result of an operation: the new state plus the events
   of its edge and of nested aggregates.
 * :class:`Operation` ``[T]`` implements edges of the hierarchy rooted at ``T``: one ``execute``
-  signature (or ``@overload``) per edge, and every edge belongs to one operation.
+  signature (or ``@overload``) per edge. Every edge ``A → B`` has one owner operation; any
+  other operation may declare that edge (or its event) only by delegating to the owner
+  through a dependency field. A loop ``A → A`` changes fields only: it has no event of the
+  root, may emit no events at all (``Transition[A, Never]``), is not an edge of the registry
+  and may appear in any number of operations.
 * :class:`Query` ``[T]`` reads states without moving them.
 
 Operations and queries are frozen, keyword-only, slotted dataclasses whose fields are their
@@ -20,10 +26,10 @@ import inspect
 import types
 import typing
 from collections.abc import Callable
-from typing import Any, ClassVar, Generic, NamedTuple, TypeVar, Union, cast, get_args, get_origin
+from typing import Any, ClassVar, Generic, NamedTuple, NoReturn, TypeVar, Union, cast, get_args, get_origin
 
 from pydantic import BaseModel, ConfigDict
-from typing_extensions import dataclass_transform
+from typing_extensions import Never, dataclass_transform
 
 from invariants.hierarchy import find_state_root, get_nested_roots, get_root_state, is_concrete_state
 from invariants.state import State, StateMachine
@@ -42,7 +48,7 @@ class TransitionError(TypeError):
 
 
 class EdgeRegistry:
-    """Owners of the state graph edges: the event and the operation of each ``(From, To)``.
+    """Owners of the state graph edges: the event and the owner operation of each ``(From, To)``.
 
     Events and operations register into the registry of their base class (the default one,
     or one passed as ``registry=`` in the class definition). Like
@@ -176,7 +182,8 @@ class OperationEdge:
     """One edge implemented by an operation's ``execute`` signature.
 
     ``event`` is the edge event (``None`` for a loop); ``events`` are all events the
-    signature declares, the edge event and the events of nested aggregates.
+    signature declares, the edge event and the events of nested aggregates (empty for
+    ``Transition[A, Never]``).
     """
 
     source: type[State] | None
@@ -229,7 +236,7 @@ def _parse_signature(
             raise TypeError(f"{where}: target {_name(target)} is not a concrete state of {root.__name__}")
         edge_name = _edge_name((source, target))
 
-        events = _unpack_union(events_annotation)
+        events = [] if events_annotation in (Never, NoReturn) else _unpack_union(events_annotation)
         root_events: list[type[Event[Any, Any]]] = []
         for event in events:
             if not (isinstance(event, type) and issubclass(event, Event)):
@@ -244,7 +251,7 @@ def _parse_signature(
 
         edge_event: type[Event[Any, Any]] | None = None
         if source is target:
-            # Without root events a loop declares only nested events, and at least one of them
+            # A loop changes fields, not the business state: only nested events, possibly none
             if root_events:
                 raise TypeError(
                     f"{where}: loop {edge_name} must not emit events of {root.__name__}, "
@@ -295,8 +302,9 @@ def get_operation_edges(cls: type) -> list[OperationEdge]:
     return edges
 
 
-def _validate_dependencies(cls: type) -> None:
+def _validate_dependencies(cls: type) -> list[type[Operation[Any] | Query[Any]]]:
     hints = typing.get_type_hints(cls)
+    dependencies: list[type[Operation[Any] | Query[Any]]] = []
     for field in dataclasses.fields(cast(Any, cls)):
         annotation = hints[field.name]
         if not (isinstance(annotation, type) and issubclass(annotation, (Operation, Query))):
@@ -304,6 +312,8 @@ def _validate_dependencies(cls: type) -> None:
                 f"{cls.__name__}.{field.name}: dependencies must be operations or queries, "
                 f"got {_name(annotation)}; pass other data as execute() arguments"
             )
+        dependencies.append(annotation)
+    return dependencies
 
 
 def _check_transition(cls: type, edges: list[OperationEdge], state: Any, result: Any) -> None:
@@ -330,11 +340,6 @@ def _check_transition(cls: type, edges: list[OperationEdge], state: Any, result:
                 f"{cls.__name__}.execute: edge {_edge_name((edge.source, edge.target))} must emit "
                 f"{edge.event.__name__} exactly once, got {count}"
             )
-    elif not result.events:
-        raise TransitionError(
-            f"{cls.__name__}.execute: loop {_edge_name((edge.source, edge.target))} must emit "
-            f"at least one event of a nested aggregate"
-        )
 
 
 def _guard_execute(cls: type, edges: list[OperationEdge]) -> None:
@@ -356,25 +361,47 @@ def _guard_execute(cls: type, edges: list[OperationEdge]) -> None:
 
 
 def validate_operation(cls: type) -> None:
-    """Validate an operation or query class (see the module docstring) and register its edges."""
-    _validate_dependencies(cls)
+    """Validate an operation or query class (see the module docstring) and register its edges.
+
+    An edge ``A → B`` declared by the operation is *delegated* when a dependency (transitively)
+    implements it, otherwise the operation owns it. Every event the operation declares must be
+    the event of an owned or a delegated edge.
+    """
+    dependencies = _validate_dependencies(cls)
+    delegated: frozenset[Edge] = frozenset().union(*(d.__implemented_edges__ for d in dependencies))
     if not issubclass(cls, Operation):
+        cast(Any, cls).__implemented_edges__ = delegated
         return
 
     if not cls.__name__.endswith("Operation"):
         raise TypeError(f"Operation class name must end with `Operation`: {cls.__name__}")
 
     edges = get_operation_edges(cls)
-    registry = cls.__registry__
+    owned = {
+        (edge.source, edge.target)
+        for edge in edges
+        if edge.source is not edge.target and (edge.source, edge.target) not in delegated
+    }
     for edge in edges:
-        owner = registry.get_operation((edge.source, edge.target))
+        for event in edge.events:
+            event_edge = get_event_edge(event)
+            if event_edge not in owned and event_edge not in delegated:
+                raise TypeError(
+                    f"{cls.__name__}: {event.__name__} is the event of {_edge_name(event_edge)}, "
+                    f"which no dependency implements; delegate to its owner through a dependency field"
+                )
+
+    registry = cls.__registry__
+    for edge_key in owned:
+        owner = registry.get_operation(edge_key)
         if owner is not None:
             raise TypeError(
-                f"{cls.__name__}: edge {_edge_name((edge.source, edge.target))} is already "
-                f"implemented by operation {owner.__name__}"
+                f"{cls.__name__}: edge {_edge_name(edge_key)} is already owned by operation "
+                f"{owner.__name__}; delegate to it through a dependency field"
             )
-    for edge in edges:
-        registry.register_operation((edge.source, edge.target), cls)
+    for edge_key in owned:
+        registry.register_operation(edge_key, cls)
+    cls.__implemented_edges__ = delegated | owned
     _guard_execute(cls, edges)
 
 
@@ -400,6 +427,8 @@ class Operation(StateMachine[T], metaclass=OperationMeta):
 
     __slots__ = ()
     __registry__: ClassVar[EdgeRegistry] = _default_registry
+    # Edges (not loops) the operation owns or delegates, including its dependencies'
+    __implemented_edges__: ClassVar[frozenset[Edge]] = frozenset()
 
     def __init_subclass__(cls, registry: EdgeRegistry | None = None, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -411,3 +440,5 @@ class Query(StateMachine[T], metaclass=OperationMeta):
     """Reads states of the hierarchy rooted at ``T`` without moving them."""
 
     __slots__ = ()
+    # Edges implemented by the query's dependencies
+    __implemented_edges__: ClassVar[frozenset[Edge]] = frozenset()

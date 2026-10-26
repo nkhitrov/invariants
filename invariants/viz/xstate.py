@@ -42,12 +42,17 @@ __all__ = [
 
 @dataclass
 class Transition:
-    """A transition of the diagram; ``source = None`` is the initial transition (creation)."""
+    """A transition of the diagram; ``source = None`` is the initial transition (creation).
+
+    ``internal`` marks a loop of an operation: a targetless transition that changes fields,
+    not the state.
+    """
 
     source: type[State] | None
     target: type[State]
     event: str
     guard: str | dict[str, Any] | None = None
+    internal: bool = False
 
 
 def _unpack_union(annotation: Any) -> list[Any]:
@@ -67,7 +72,7 @@ def _returns_operation_transitions(annotation: Any) -> bool:
 def _extract_operation_transitions(machine_cls: type) -> list[Transition] | None:
     """Transitions of an operation: one per edge, named after the edge event.
 
-    A loop has no event of its own, so it is named after the operation.
+    A loop has no event of its own: it is an internal transition named after the operation.
     """
     try:
         edges = get_operation_edges(machine_cls)
@@ -78,6 +83,7 @@ def _extract_operation_transitions(machine_cls: type) -> list[Transition] | None
             source=edge.source,
             target=edge.target,
             event=edge.event.__name__ if edge.event is not None else machine_cls.__name__,
+            internal=edge.source is edge.target,
         )
         for edge in edges
     ]
@@ -207,11 +213,24 @@ def attach_guards(
     transitions: list[Transition],
     nestings: list[NestingRelation],
 ) -> list[Transition]:
-    """Attach guards to transitions based on target state's nested field annotations."""
+    """Attach guards to transitions based on target state's nested field annotations.
+
+    A nested field annotated the same way in every parent state (e.g. ``payments`` of a loan)
+    does not tell the states apart, so it yields no guard.
+    """
+    discriminating = [
+        nesting
+        for nesting in nestings
+        if len(nesting.allowed_children) < 2
+        or len({repr(extract_guard_name(parent, nesting.field_name)) for parent in nesting.allowed_children}) > 1
+    ]
     result: list[Transition] = []
     for t in transitions:
+        if t.internal:
+            result.append(t)
+            continue
         guard = None
-        for nesting in nestings:
+        for nesting in discriminating:
             if t.target in nesting.allowed_children:
                 guard = extract_guard_name(t.target, nesting.field_name)
                 break
@@ -309,7 +328,10 @@ def _build_on_dict(
     for t in transitions:
         if t.source is state_cls:
             event_name = t.event
-            if t.guard is not None:
+            if t.internal:
+                # Targetless: the state stays, no exit/entry
+                on_dict.setdefault(event_name, []).append({})
+            elif t.guard is not None:
                 entry: dict[str, Any] = {"target": t.target.__name__, "guard": t.guard}
                 if event_name in on_dict:
                     existing = on_dict[event_name]
@@ -342,7 +364,8 @@ def build_xstate_config(machines: Sequence[type]) -> dict[str, dict[str, Any]]:
         transitions = extract_transitions(machine_cls)
         if transitions is None:
             continue
-        groups[root].extend(transitions)
+        # A delegated edge is declared by its owner and by every delegating operation
+        groups[root].extend(t for t in transitions if t not in groups[root])
 
     nestings = detect_all_nestings(machines)
 
@@ -406,11 +429,11 @@ def _render_guard(guard: str | dict[str, Any]) -> str:
 
 
 def _render_transition_object(item: dict[str, Any]) -> str:
-    """Render a transition object like { target: 'X', guard: 'Y' }."""
-    parts = [f"target: '{item['target']}'"]
+    """Render a transition object like { target: 'X', guard: 'Y' } (``{}`` for an internal one)."""
+    parts = [f"target: '{item['target']}'"] if "target" in item else []
     if "guard" in item:
         parts.append(f"guard: {_render_guard(item['guard'])}")
-    return "{ " + ", ".join(parts) + " }"
+    return "{ " + ", ".join(parts) + " }" if parts else "{}"
 
 
 def _render_state_config(state_name: str, state_config: dict[str, Any], indent: int) -> str:
