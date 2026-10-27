@@ -15,42 +15,44 @@ from pathlib import Path
 from collections.abc import Sequence
 from typing import Any, Union, get_args, get_origin
 
-from typing_extensions import get_original_bases
-
+from invariants.hierarchy import (
+    NestingRelation,
+    _is_state_subclass,
+    detect_nesting,
+    find_state_root,
+    get_concrete_states,
+    get_root_state,
+    unwrap_state_types,
+)
+from invariants.operations import Transition as OperationTransition
+from invariants.operations import get_operation_edges
 from invariants.state import State, StateMachine
+
+__all__ = [
+    "NestingRelation",
+    "Transition",
+    "_is_state_subclass",
+    "detect_nesting",
+    "find_state_root",
+    "get_concrete_states",
+    "get_root_state",
+    "unwrap_state_types",
+]
 
 
 @dataclass
 class Transition:
-    source: type[State]
+    """A transition of the diagram; ``source = None`` is the initial transition (creation).
+
+    ``internal`` marks a loop of an operation: a targetless transition that changes fields,
+    not the state.
+    """
+
+    source: type[State] | None
     target: type[State]
     event: str
     guard: str | dict[str, Any] | None = None
-
-
-def get_root_state(machine_cls: type) -> type[State] | None:
-    """Extract the generic parameter T from StateMachine[T]."""
-    for base in get_original_bases(machine_cls):
-        origin = get_origin(base)
-        if origin is not None and issubclass(origin, StateMachine):
-            args = get_args(base)
-            if args and len(args) == 1 and isinstance(args[0], type) and issubclass(args[0], State):
-                return args[0]
-    return None
-
-
-def get_concrete_states(root_state: type[State]) -> list[type[State]]:
-    """Get all concrete (non-Statefull) descendants of a root state."""
-    result: list[type[State]] = []
-
-    def walk(cls: type[State]) -> None:
-        if cls is not root_state and not cls.has_statefull_fields():
-            result.append(cls)
-        for sub in cls.__subclasses__():
-            walk(sub)
-
-    walk(root_state)
-    return result
+    internal: bool = False
 
 
 def _unpack_union(annotation: Any) -> list[Any]:
@@ -61,12 +63,40 @@ def _unpack_union(annotation: Any) -> list[Any]:
     return [annotation]
 
 
-def _is_state_subclass(t: Any) -> bool:
-    return isinstance(t, type) and issubclass(t, State)
+def _returns_operation_transitions(annotation: Any) -> bool:
+    return annotation is not None and all(
+        get_origin(t) is OperationTransition for t in _unpack_union(annotation)
+    )
+
+
+def _extract_operation_transitions(machine_cls: type) -> list[Transition] | None:
+    """Transitions of an operation: one per edge, named after the edge event.
+
+    A loop has no event of its own: it is an internal transition named after the operation.
+    """
+    try:
+        edges = get_operation_edges(machine_cls)
+    except TypeError:
+        return None
+    return [
+        Transition(
+            source=edge.source,
+            target=edge.target,
+            event=edge.event.__name__ if edge.event is not None else machine_cls.__name__,
+            internal=edge.source is edge.target,
+        )
+        for edge in edges
+    ]
 
 
 def extract_transitions(machine_cls: type) -> list[Transition] | None:
     """Extract transitions from the execute method's type hints.
+
+    ``execute(self, state: A, ...) -> Transition[B, E]`` (per ``@overload`` and per union
+    member of the return type) yields an edge ``A → B`` named after its event; without a
+    state parameter the edge starts from the initial state (``source = None``).
+    The legacy form ``execute(self, state: A | B) -> C | D`` yields every ``A/B → C/D``
+    named after the machine.
 
     Returns None if the machine is a query (non-State return type)
     or has invalid signatures.
@@ -80,12 +110,15 @@ def extract_transitions(machine_cls: type) -> list[Transition] | None:
     except Exception:  # pragma: no cover
         return None
 
+    return_annotation = hints.get("return")
+    if _returns_operation_transitions(return_annotation):
+        return _extract_operation_transitions(machine_cls)
+
     params = list(inspect.signature(execute).parameters.keys())
     if len(params) < 2:
         return None
 
     input_annotation = hints.get(params[1])
-    return_annotation = hints.get("return")
 
     if input_annotation is None or return_annotation is None:
         return None
@@ -109,108 +142,6 @@ def extract_transitions(machine_cls: type) -> list[Transition] | None:
         for inp in input_types
         for out in output_types
     ]
-
-
-@dataclass
-class NestingRelation:
-    parent_root: type[State]
-    child_root: type[State]
-    field_name: str
-    allowed_children: dict[type[State], set[type[State]]]
-
-
-def unwrap_state_types(annotation: Any) -> set[type[State]]:
-    """Recursively unwrap a type annotation to find all State subclasses."""
-    if _is_state_subclass(annotation):
-        return {annotation}
-
-    origin = get_origin(annotation)
-
-    # Annotated[X, ...] → unwrap X
-    if origin is typing.Annotated:
-        args = get_args(annotation)
-        if args:
-            return unwrap_state_types(args[0])
-
-    # Union / X | Y → unwrap each
-    if origin is Union or origin is types.UnionType:
-        result: set[type[State]] = set()
-        for arg in get_args(annotation):
-            result |= unwrap_state_types(arg)
-        return result
-
-    # tuple[X, ...] → unwrap X
-    if origin is tuple:
-        args = get_args(annotation)
-        if args:
-            result = set()
-            for arg in args:
-                if arg is not Ellipsis:
-                    result |= unwrap_state_types(arg)
-            return result
-
-    return set()
-
-
-def find_state_root(state_types: set[type[State]]) -> type[State] | None:
-    """Find the common root State for a set of concrete states."""
-    if not state_types:
-        return None
-
-    def _get_root(cls: type) -> type[State] | None:
-        for klass in cls.__mro__:
-            if klass is State or klass is object:
-                continue  # pragma: no cover
-            if issubclass(klass, State) and State in klass.__bases__:
-                return klass
-        return None  # pragma: no cover
-
-    roots = {_get_root(t) for t in state_types}
-    roots.discard(None)
-    if len(roots) == 1:
-        return roots.pop()
-    return None
-
-
-def detect_nesting(
-    parent_root: type[State],
-    child_roots: set[type[State]],
-) -> list[NestingRelation]:
-    """Detect nesting relationships between parent and child state hierarchies."""
-    concrete_parents = get_concrete_states(parent_root)
-    # field_name → {parent_concrete → set of child states}
-    field_groups: dict[str, dict[type[State], set[type[State]]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
-
-    for parent_cls in concrete_parents:
-        hints = typing.get_type_hints(parent_cls, include_extras=True)
-        for field_name, annotation in hints.items():
-            state_types = unwrap_state_types(annotation)
-            if state_types:
-                root = find_state_root(state_types)
-                if root is not None and root in child_roots and root is not parent_root:
-                    field_groups[field_name][parent_cls] = state_types
-
-    result: list[NestingRelation] = []
-    for field_name, parent_map in field_groups.items():
-        if not parent_map:  # pragma: no cover
-            continue
-        # All should share the same child root
-        all_types = set()
-        for types_set in parent_map.values():
-            all_types |= types_set
-        child_root = find_state_root(all_types)
-        if child_root is None:  # pragma: no cover
-            continue
-        result.append(NestingRelation(
-            parent_root=parent_root,
-            child_root=child_root,
-            field_name=field_name,
-            allowed_children=dict(parent_map),
-        ))
-
-    return result
 
 
 def detect_all_nestings(machines: Sequence[type]) -> list[NestingRelation]:
@@ -282,11 +213,24 @@ def attach_guards(
     transitions: list[Transition],
     nestings: list[NestingRelation],
 ) -> list[Transition]:
-    """Attach guards to transitions based on target state's nested field annotations."""
+    """Attach guards to transitions based on target state's nested field annotations.
+
+    A nested field annotated the same way in every parent state (e.g. ``payments`` of a loan)
+    does not tell the states apart, so it yields no guard.
+    """
+    discriminating = [
+        nesting
+        for nesting in nestings
+        if len(nesting.allowed_children) < 2
+        or len({repr(extract_guard_name(parent, nesting.field_name)) for parent in nesting.allowed_children}) > 1
+    ]
     result: list[Transition] = []
     for t in transitions:
+        if t.internal:
+            result.append(t)
+            continue
         guard = None
-        for nesting in nestings:
+        for nesting in discriminating:
             if t.target in nesting.allowed_children:
                 guard = extract_guard_name(t.target, nesting.field_name)
                 break
@@ -320,11 +264,15 @@ def _get_imported_modules(module: types.ModuleType) -> list[types.ModuleType]:
         obj = getattr(module, name)
         if isinstance(obj, types.ModuleType) and obj is not module:
             result.append(obj)
-    # Also check for 'from X import Y' — scan sys.modules for modules
-    # whose names appear as prefixes of imported State classes
+    # Also check for 'from X import Y' — scan sys.modules for modules of imported State
+    # classes and machines (states and operations often live in separate modules)
     for name in dir(module):
         obj = getattr(module, name)
-        if isinstance(obj, type) and issubclass(obj, State) and obj.__module__ != module.__name__:
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, (State, StateMachine))
+            and obj.__module__ != module.__name__
+        ):
             imported_mod = sys.modules.get(obj.__module__)
             if imported_mod is not None and imported_mod not in result:
                 result.append(imported_mod)
@@ -384,7 +332,10 @@ def _build_on_dict(
     for t in transitions:
         if t.source is state_cls:
             event_name = t.event
-            if t.guard is not None:
+            if t.internal:
+                # Targetless: the state stays, no exit/entry
+                on_dict.setdefault(event_name, []).append({})
+            elif t.guard is not None:
                 entry: dict[str, Any] = {"target": t.target.__name__, "guard": t.guard}
                 if event_name in on_dict:
                     existing = on_dict[event_name]
@@ -417,7 +368,8 @@ def build_xstate_config(machines: Sequence[type]) -> dict[str, dict[str, Any]]:
         transitions = extract_transitions(machine_cls)
         if transitions is None:
             continue
-        groups[root].extend(transitions)
+        # A delegated edge is declared by its owner and by every delegating operation
+        groups[root].extend(t for t in transitions if t not in groups[root])
 
     nestings = detect_all_nestings(machines)
 
@@ -433,8 +385,12 @@ def build_xstate_config(machines: Sequence[type]) -> dict[str, dict[str, Any]]:
         states_dict: dict[str, Any] = {}
 
         sources_with_outgoing: set[str] = set()
+        initial_targets: list[str] = []
         for t in transitions:
-            sources_with_outgoing.add(t.source.__name__)
+            if t.source is None:
+                initial_targets.append(t.target.__name__)
+            else:
+                sources_with_outgoing.add(t.source.__name__)
 
         for state_cls in concrete:
             on_dict = _build_on_dict(state_cls, transitions)
@@ -447,7 +403,11 @@ def build_xstate_config(machines: Sequence[type]) -> dict[str, dict[str, Any]]:
                 state_config["on"] = on_dict
             states_dict[state_cls.__name__] = state_config
 
-        initial = concrete[0].__name__ if concrete else None
+        # The creation edge (``None → B``) is the initial state; otherwise the first concrete one
+        if initial_targets:
+            initial: str | None = initial_targets[0]
+        else:
+            initial = concrete[0].__name__ if concrete else None
         config: dict[str, Any] = {
             "id": root_state.__name__,
             "states": states_dict,
@@ -473,11 +433,11 @@ def _render_guard(guard: str | dict[str, Any]) -> str:
 
 
 def _render_transition_object(item: dict[str, Any]) -> str:
-    """Render a transition object like { target: 'X', guard: 'Y' }."""
-    parts = [f"target: '{item['target']}'"]
+    """Render a transition object like { target: 'X', guard: 'Y' } (``{}`` for an internal one)."""
+    parts = [f"target: '{item['target']}'"] if "target" in item else []
     if "guard" in item:
         parts.append(f"guard: {_render_guard(item['guard'])}")
-    return "{ " + ", ".join(parts) + " }"
+    return "{ " + ", ".join(parts) + " }" if parts else "{}"
 
 
 def _render_state_config(state_name: str, state_config: dict[str, Any], indent: int) -> str:
@@ -832,10 +792,10 @@ def main() -> None:  # pragma: no cover
     subparsers = parser.add_subparsers(dest="command")
 
     print_parser = subparsers.add_parser("print", help="Print xstate JS code to stdout")
-    print_parser.add_argument("module", help="Python module path to scan (e.g. examples.example)")
+    print_parser.add_argument("module", help="Python module path to scan (e.g. examples.debt.operations)")
 
     serve_parser = subparsers.add_parser("serve", help="Start xstate-viz dev server")
-    serve_parser.add_argument("module", help="Python module path to scan (e.g. examples.example)")
+    serve_parser.add_argument("module", help="Python module path to scan (e.g. examples.debt.operations)")
     serve_parser.add_argument("-p", "--port", type=int, default=3000, help="Dev server port (default: 3000)")
 
     args = parser.parse_args()
