@@ -32,7 +32,7 @@ make check
 # XState: print generated JS code
 uv run python -m invariants.viz print examples.debt.operations
 
-# XState: start visualizer (auto-clones statelyai/sketch, requires node + pnpm or npx)
+# XState: start visualizer (auto-clones statelyai/sketch, requires node; uses pnpm of the major Sketch pins, else npx pnpm@<pinned>)
 uv run python -m invariants.viz serve examples.debt.operations
 ```
 

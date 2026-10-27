@@ -357,7 +357,7 @@ operation, and the creation edge (`None → B`) sets the initial state:
 python -m invariants.viz print examples.debt.operations
 
 # Start a local Stately Sketch with one document per state machine
-# (clones https://github.com/statelyai/sketch on first run; needs Node.js with pnpm or npx)
+# (clones https://github.com/statelyai/sketch on first run; needs Node.js; uses pnpm if its major version matches the one Sketch pins, npx otherwise)
 python -m invariants.viz serve examples.debt.operations
 ```
 

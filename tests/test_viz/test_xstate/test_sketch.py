@@ -3,7 +3,9 @@
 import io
 import json
 import shutil
+import subprocess
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -59,16 +61,67 @@ class TestSketchEnv:
         assert "NODE_OPTIONS" not in env
 
 
+class TestSketchPnpmVersion:
+    def test_reads_package_manager(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text(json.dumps({"packageManager": "pnpm@10.32.1"}))
+        assert xstate._sketch_pnpm_version(tmp_path) == "10.32.1"
+
+    def test_drops_integrity_hash(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text(json.dumps({"packageManager": "pnpm@11.0.0+sha512.abc"}))
+        assert xstate._sketch_pnpm_version(tmp_path) == "11.0.0"
+
+    @pytest.mark.parametrize(
+        "content",
+        [None, "not json", json.dumps([]), json.dumps({}), json.dumps({"packageManager": "yarn@4.0.0"})],
+    )
+    def test_defaults_without_pinned_pnpm(self, tmp_path: Path, content: str | None) -> None:
+        if content is not None:
+            (tmp_path / "package.json").write_text(content)
+        assert xstate._sketch_pnpm_version(tmp_path) == xstate._PNPM_VERSION
+
+
+def fake_pnpm(monkeypatch: pytest.MonkeyPatch, *, on_path: set[str], version: str | None = None) -> None:
+    """Pretend ``on_path`` tools are installed and ``pnpm --version`` prints ``version``."""
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}" if cmd in on_path else None)
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert args == ["pnpm", "--version"]
+        if version is None:
+            raise OSError("pnpm is broken")
+        return subprocess.CompletedProcess(args, 0, stdout=f"{version}\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+
 class TestPnpmCommand:
-    def test_prefers_pnpm_on_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/pnpm" if cmd == "pnpm" else None)
-        assert xstate._pnpm_command() == ["pnpm"]
+    def test_uses_pnpm_on_path_with_the_same_major(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_pnpm(monkeypatch, on_path={"pnpm", "npx"}, version="10.1.0")
+        assert xstate._pnpm_command("10.32.1") == ["pnpm"]
+
+    def test_uses_npx_when_pnpm_on_path_has_another_major(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fake_pnpm(monkeypatch, on_path={"pnpm", "npx"}, version="9.15.9")
+        assert xstate._pnpm_command("10.32.1") == ["npx", "--yes", "pnpm@10.32.1"]
+        assert "pnpm 9.15.9 on PATH" in capsys.readouterr().err
+
+    def test_uses_npx_when_pnpm_on_path_does_not_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_pnpm(monkeypatch, on_path={"pnpm", "npx"}, version=None)
+        assert xstate._pnpm_command("10.32.1") == ["npx", "--yes", "pnpm@10.32.1"]
 
     def test_falls_back_to_npx(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/npx" if cmd == "npx" else None)
+        fake_pnpm(monkeypatch, on_path={"npx"})
         assert xstate._pnpm_command() == ["npx", "--yes", f"pnpm@{xstate._PNPM_VERSION}"]
 
+    def test_errors_on_another_major_without_npx(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fake_pnpm(monkeypatch, on_path={"pnpm"}, version="9.15.9")
+        with pytest.raises(SystemExit):
+            xstate._pnpm_command("10.32.1")
+        assert "needs pnpm 10.32.1, found pnpm 9.15.9" in capsys.readouterr().err
+
     def test_errors_without_node_tooling(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(shutil, "which", lambda cmd: None)
+        fake_pnpm(monkeypatch, on_path=set())
         with pytest.raises(SystemExit):
             xstate._pnpm_command()
