@@ -27,6 +27,9 @@ class PaymentFacts(Protocol):
     def amount(self) -> Decimal: ...
     @property
     def paid_at(self) -> date: ...
+    # Set for a payment moved from a cancelled restructuring: it pays installments before penalty
+    @property
+    def transferred_from_loan_id(self) -> int | None: ...
 
 
 class LoanFacts(Protocol):
@@ -79,16 +82,31 @@ def allocate(
 
     A day starts with the daily penalty if an installment whose postponement date has passed
     is still unpaid; then the payments of that day pay the outstanding penalty first and the
-    installments in schedule order after it.
+    installments in schedule order after it. A payment transferred from a cancelled
+    restructuring pays the installments first and the penalty with what is left.
     """
     paid = [ZERO] * len(schedule)
     penalty_due = penalty_accrued = penalty_paid = overpaid = ZERO
     daily_penalty = financed_amount * PENALTY_RATE_PER_DAY
 
-    payments_by_day: dict[date, list[Decimal]] = defaultdict(list)
+    payments_by_day: dict[date, list[PaymentFacts]] = defaultdict(list)
     for payment in payments:
         if payment.paid_at <= booking_date:
-            payments_by_day[payment.paid_at].append(payment.amount)
+            payments_by_day[payment.paid_at].append(payment)
+
+    def pay_penalty(amount: Decimal) -> Decimal:
+        nonlocal penalty_due, penalty_paid
+        share = min(amount, penalty_due)
+        penalty_due -= share
+        penalty_paid += share
+        return amount - share
+
+    def pay_installments(amount: Decimal) -> Decimal:
+        for index, installment in enumerate(schedule):
+            share = min(amount, installment.amount - paid[index])
+            paid[index] += share
+            amount -= share
+        return amount
 
     start = min([installment.postponement_date for installment in schedule] + list(payments_by_day))
     for day in _days(start, booking_date):
@@ -99,16 +117,11 @@ def allocate(
             penalty_due += daily_penalty
             penalty_accrued += daily_penalty
 
-        for amount in payments_by_day.get(day, []):
-            to_penalty = min(amount, penalty_due)
-            penalty_due -= to_penalty
-            penalty_paid += to_penalty
-            amount -= to_penalty
-            for index, installment in enumerate(schedule):
-                share = min(amount, installment.amount - paid[index])
-                paid[index] += share
-                amount -= share
-            overpaid += amount
+        for payment in payments_by_day.get(day, []):
+            if payment.transferred_from_loan_id is None:
+                overpaid += pay_installments(pay_penalty(payment.amount))
+            else:
+                overpaid += pay_penalty(pay_installments(payment.amount))
 
     return Allocation(
         penalty_accrued=penalty_accrued,

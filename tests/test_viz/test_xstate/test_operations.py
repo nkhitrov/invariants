@@ -121,3 +121,25 @@ class TestOperationConfig:
         machines = discover_machines(importlib.import_module("examples.debt"))
         names = {m.__name__ for m in machines}
         assert {"OpenDebtOperation", "CheckDebtOverdueDaysQuery", "CloseLoanOperation"} <= names
+
+
+class TestTwoLevelNesting:
+    """Debt → restructuring → loans."""
+
+    def test_nested_roots_are_transitive(self) -> None:
+        from examples.debt import DebtState
+        from examples.loan import LoanState
+        from examples.payment import PaymentState
+        from examples.restructuring import RestructuringState
+        from invariants.hierarchy import get_nested_roots
+
+        assert get_nested_roots(DebtState) == {LoanState, RestructuringState, PaymentState}
+
+    def test_restructured_debt_in_diagram(self) -> None:
+        configs = build_xstate_config(discover_machines(importlib.import_module("examples.debt")))
+        restructured = configs["DebtState"]["states"]["RestructuredDebt"]["on"]
+        assert restructured["RecalculateDebtOperation"] == [{}]
+        assert {"RestructuringCancelledToOverdueEvent", "RestructuringCancelledToActiveEvent",
+                "RestructuredDebtClosedEvent"} <= set(restructured)
+        assert configs["DebtState"]["states"]["ClosedRestructuredDebt"]["type"] == "final"
+        assert "RestructuringState" in configs

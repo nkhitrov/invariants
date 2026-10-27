@@ -17,6 +17,8 @@ class Installment(BaseModel):
 
     postponement_date: date
     amount: Decimal
+    # In a restructuring schedule: the original loan this installment pays off
+    original_loan_id: int | None = None
 
 
 class LoanState(State):

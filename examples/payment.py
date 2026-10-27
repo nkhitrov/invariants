@@ -12,6 +12,8 @@ class PaymentState(State):
     id: int
     amount: Decimal
     paid_at: date
+    # The restructuring loan the payment was made to, when moved to an original loan on cancellation
+    transferred_from_loan_id: int | None = None
     status: Statefull
 
 

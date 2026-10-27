@@ -43,6 +43,7 @@ class PaymentState(State):
     id: int
     amount: Decimal
     paid_at: date
+    transferred_from_loan_id: int | None = None  # moved here from a cancelled restructuring
     status: Statefull
 
 
@@ -239,6 +240,28 @@ operation = ReceiveLoanPaymentOperation(receive_payment=ReceivePaymentOperation(
 The debt example ([`examples/debt.py`](examples/debt.py)) composes the same way: `RecalculateDebtOperation`
 delegates to the loan recalculation and penalty operations, and `ReceiveDebtPaymentOperation` pays a loan and,
 once no installment is overdue, delegates `OverdueDebt → ActiveDebt` to its owner `CancelDebtOverdueOperation`.
+
+### Example: debt restructuring
+
+[`examples/restructuring.py`](examples/restructuring.py) and [`examples/debt.py`](examples/debt.py) show a nested
+entity two levels deep (debt → restructuring → loans):
+
+- The terms are approved outside the invariants and come in as a value object: `RestructuringTerms(id, loans)`, where
+  each `LoanTerms` has `loan_id`, `financed_amount` and `schedule`. Each installment of a restructuring loan names
+  the original loan it pays off (`Installment.original_loan_id`), so loans map 1:1 or N:M.
+- `ApplyRestructuringOperation` owns `ActiveDebt → RestructuredDebt` and `OverdueDebt → RestructuredDebt`. It
+  issues the new loans by delegating to `IssueLoanOperation`. `RestructuredDebt` keeps a snapshot of the original
+  loans so it can roll back.
+- The restructuring loans are ordinary loans. The daily recalculation and payments are loops of `RestructuredDebt`
+  that work on them.
+- `CancelRestructuringOperation` owns `RestructuredDebt → OverdueDebt | ActiveDebt`. The application calls it
+  directly, and the daily recalculation delegates to it as soon as a restructuring loan would become overdue.
+  On cancellation, payments made to the restructuring loans move to the original loans by the installment mapping.
+  A moved payment (`transferred_from_loan_id`) pays the principal before the penalty. Then the original loans are
+  recalculated by their own schedule, so the penalty is computed as if there had been no restructuring.
+  The cancelled restructuring is dropped from the debt: the debt's edge event records the cancellation.
+- `CloseDebtOperation` owns `RestructuredDebt → ClosedRestructuredDebt`. It closes the restructuring and its loans
+  by delegation.
 
 ### Queries
 

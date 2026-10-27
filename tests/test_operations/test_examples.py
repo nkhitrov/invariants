@@ -9,30 +9,23 @@ from examples.calculations import accrued_penalty, is_repaid, outstanding_amount
 from examples.debt import (
     ActiveDebt,
     ActiveDebtClosedEvent,
-    CancelDebtOverdueOperation,
     CheckDebtOverdueDaysQuery,
-    CloseDebtOperation,
     ClosedDebt,
     DebtBecameOverdueEvent,
     DebtOpenedEvent,
     DebtOverdueCancelledEvent,
     DebtStillOverdueError,
     LoanNotFoundError,
-    OpenDebtOperation,
     OverdueDebt,
     OverdueDebtClosedEvent,
-    RecalculateDebtOperation,
-    ReceiveDebtPaymentOperation,
 )
 from examples.loan import (
     AccruePenaltyOperation,
     ActiveLoan,
     ActiveLoanClosedEvent,
-    CancelLoanOverdueOperation,
     CloseLoanOperation,
     ClosedLoan,
     Installment,
-    IssueLoanOperation,
     LoanBecameOverdueEvent,
     LoanIssuedEvent,
     LoanNotRepaidError,
@@ -40,10 +33,17 @@ from examples.loan import (
     LoanStillOverdueError,
     OverdueLoan,
     OverdueLoanClosedEvent,
-    ReceiveLoanPaymentOperation,
-    RecalculateLoanTermsOperation,
 )
-from examples.payment import PaymentReceivedEvent, ReceivePaymentOperation
+from examples.payment import PaymentReceivedEvent
+from tests.support.wiring import (
+    cancel_debt_overdue,
+    cancel_loan_overdue,
+    close_debt,
+    open_debt,
+    receive_debt_payment,
+    receive_loan_payment,
+    recalculate_debt,
+)
 
 ISSUED = date(2026, 1, 1)
 FIRST_DUE = date(2026, 1, 31)
@@ -58,19 +58,6 @@ TWO_INSTALLMENTS = (
     Installment(postponement_date=SECOND_DUE, amount=Decimal(500)),
 )
 
-open_debt = OpenDebtOperation(issue_loan=IssueLoanOperation())
-recalculate_debt = RecalculateDebtOperation(
-    recalculate_loan_terms=RecalculateLoanTermsOperation(), accrue_penalty=AccruePenaltyOperation()
-)
-receive_loan_payment = ReceiveLoanPaymentOperation(receive_payment=ReceivePaymentOperation())
-cancel_loan_overdue = CancelLoanOverdueOperation()
-cancel_debt_overdue = CancelDebtOverdueOperation(cancel_loan_overdue=cancel_loan_overdue)
-receive_debt_payment = ReceiveDebtPaymentOperation(
-    receive_loan_payment=receive_loan_payment,
-    cancel_loan_overdue=cancel_loan_overdue,
-    cancel_debt_overdue=cancel_debt_overdue,
-)
-close_debt = CloseDebtOperation(close_loan=CloseLoanOperation())
 
 
 def opened(schedule: tuple[Installment, ...] = TWO_INSTALLMENTS) -> ActiveDebt:

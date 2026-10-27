@@ -19,8 +19,19 @@ from examples.loan import (
     OverdueLoanClosedEvent,
     ReceiveLoanPaymentOperation,
     RecalculateLoanTermsOperation,
+    loan_fields,
 )
-from examples.payment import PaymentReceivedEvent
+from examples.payment import PaymentReceivedEvent, ReceivedPayment
+from examples.restructuring import (
+    ActiveRestructuring,
+    CloseRestructuringOperation,
+    ClosedRestructuring,
+    OpenRestructuringOperation,
+    RestructuringAppliedEvent,
+    RestructuringClosedEvent,
+    RestructuringTerms,
+    transferred_payments,
+)
 from invariants.conditions import ContainsOne
 from invariants.operations import Event, Operation, Query, Transition
 from invariants.state import State, Statefull
@@ -29,11 +40,16 @@ Loan = ActiveLoan | OverdueLoan | ClosedLoan
 
 
 class DebtState(State):
-    """Debt. It has no money of its own: its state is derived from the states of its loans."""
+    """Debt. It has no money of its own: its state is derived from the states of its loans.
+
+    ``loans`` are the original loans; ``restructuring`` holds the loans that replace them
+    while the debt is restructured.
+    """
 
     id: int
     status: Statefull
     loans: Statefull
+    restructuring: Statefull
 
 
 class ActiveDebt(DebtState):
@@ -41,6 +57,7 @@ class ActiveDebt(DebtState):
 
     status: Literal["active"] = "active"
     loans: Annotated[tuple[ActiveLoan | ClosedLoan, ...], ContainsOne(ActiveLoan)]
+    restructuring: None = None
 
 
 class ClosedDebt(DebtState):
@@ -48,6 +65,7 @@ class ClosedDebt(DebtState):
 
     status: Literal["closed"] = "closed"
     loans: tuple[ClosedLoan, ...]
+    restructuring: None = None
 
 
 class OverdueDebt(DebtState):
@@ -57,9 +75,26 @@ class OverdueDebt(DebtState):
     loans: Annotated[
         tuple[OverdueLoan | ActiveLoan | ClosedLoan, ...], ContainsOne(OverdueLoan)
     ]
+    restructuring: None = None
 
 
-Debt = ActiveDebt | ClosedDebt | OverdueDebt
+class RestructuredDebt(DebtState):
+    """Paid by the restructuring loans; ``loans`` is the snapshot of the original loans, kept to roll back."""
+
+    status: Literal["restructured"] = "restructured"
+    loans: tuple[OverdueLoan | ActiveLoan | ClosedLoan, ...]
+    restructuring: ActiveRestructuring
+
+
+class ClosedRestructuredDebt(DebtState):
+    """Closed on the restructuring terms; ``loans`` is the same snapshot of the original loans."""
+
+    status: Literal["closed_restructured"] = "closed_restructured"
+    loans: tuple[OverdueLoan | ActiveLoan | ClosedLoan, ...]
+    restructuring: ClosedRestructuring
+
+
+Debt = ActiveDebt | ClosedDebt | OverdueDebt | RestructuredDebt | ClosedRestructuredDebt
 
 
 class LoanNotFoundError(LookupError):
@@ -72,6 +107,12 @@ class DebtStillOverdueError(ValueError):
     def __init__(self, debt_id: int) -> None:
         super().__init__(f"Debt {debt_id} still has overdue loans")
         self.debt_id = debt_id
+
+
+class UnknownOriginalLoanError(ValueError):
+    def __init__(self, loan_id: int) -> None:
+        super().__init__(f"Restructuring terms refer to loan {loan_id}, which is not an open loan of the debt")
+        self.loan_id = loan_id
 
 
 def replace_loan(loans: tuple[Loan, ...], loan: Loan) -> tuple[Loan, ...]:
@@ -101,6 +142,31 @@ class OverdueDebtClosedEvent(Event[OverdueDebt, ClosedDebt]):
     debt_id: int
 
 
+class ActiveDebtRestructuredEvent(Event[ActiveDebt, RestructuredDebt]):
+    debt_id: int
+    restructuring_id: int
+
+
+class OverdueDebtRestructuredEvent(Event[OverdueDebt, RestructuredDebt]):
+    debt_id: int
+    restructuring_id: int
+
+
+class RestructuringCancelledToOverdueEvent(Event[RestructuredDebt, OverdueDebt]):
+    debt_id: int
+    restructuring_id: int
+
+
+class RestructuringCancelledToActiveEvent(Event[RestructuredDebt, ActiveDebt]):
+    debt_id: int
+    restructuring_id: int
+
+
+class RestructuredDebtClosedEvent(Event[RestructuredDebt, ClosedRestructuredDebt]):
+    debt_id: int
+    restructuring_id: int
+
+
 class OpenDebtOperation(Operation[DebtState]):
     """Open a debt with its first loan: both start active."""
 
@@ -122,15 +188,117 @@ class OpenDebtOperation(Operation[DebtState]):
         return Transition(debt, (DebtOpenedEvent(debt_id=debt_id), *loan_events))
 
 
-class RecalculateDebtOperation(Operation[DebtState]):
-    """Daily recalculation: move the booking date of every open loan.
+class ApplyRestructuringOperation(Operation[DebtState]):
+    """Apply approved restructuring terms: the restructuring loans replace the original ones.
 
-    Active loans may become overdue (and then the debt does), overdue loans accrue penalty,
-    closed loans are left as they are.
+    It can be applied to an overdue debt, or in advance to an active one.
+    """
+
+    open_restructuring: OpenRestructuringOperation
+
+    @overload
+    def execute(
+        self, debt: ActiveDebt, *, terms: RestructuringTerms, booking_date: date
+    ) -> Transition[RestructuredDebt, ActiveDebtRestructuredEvent | RestructuringAppliedEvent | LoanIssuedEvent]: ...
+    @overload
+    def execute(
+        self, debt: OverdueDebt, *, terms: RestructuringTerms, booking_date: date
+    ) -> Transition[RestructuredDebt, OverdueDebtRestructuredEvent | RestructuringAppliedEvent | LoanIssuedEvent]: ...
+    def execute(self, debt: ActiveDebt | OverdueDebt, *, terms: RestructuringTerms, booking_date: date) -> Transition[
+        RestructuredDebt,
+        ActiveDebtRestructuredEvent | OverdueDebtRestructuredEvent | RestructuringAppliedEvent | LoanIssuedEvent,
+    ]:
+        open_loans = {loan.id for loan in debt.loans if not isinstance(loan, ClosedLoan)}
+        for loan_terms in terms.loans:
+            for installment in loan_terms.schedule:
+                if installment.original_loan_id not in open_loans:
+                    raise UnknownOriginalLoanError(installment.original_loan_id or 0)
+
+        restructuring, events = self.open_restructuring.execute(terms=terms, booking_date=booking_date)
+        restructured = RestructuredDebt(id=debt.id, loans=debt.loans, restructuring=restructuring)
+        match debt:
+            case ActiveDebt():
+                applied = ActiveDebtRestructuredEvent(debt_id=debt.id, restructuring_id=terms.id)
+                return Transition(restructured, (applied, *events))
+            case OverdueDebt():
+                overdue_applied = OverdueDebtRestructuredEvent(debt_id=debt.id, restructuring_id=terms.id)
+                return Transition(restructured, (overdue_applied, *events))
+
+
+class CancelRestructuringOperation(Operation[DebtState]):
+    """Cancel a restructuring and roll the debt back to its original loans.
+
+    The application calls it directly (e.g. the client broke other terms), and the daily
+    recalculation delegates to it once a restructuring loan would become overdue.
+    Payments made to the restructuring loans move to the original loans by the installment
+    mapping (they pay the principal before the penalty); then the original loans are
+    recalculated on ``booking_date`` by their own schedule, so the penalty is computed as if
+    there had been no restructuring.
     """
 
     recalculate_loan_terms: RecalculateLoanTermsOperation
     accrue_penalty: AccruePenaltyOperation
+    cancel_loan_overdue: CancelLoanOverdueOperation
+
+    def execute(self, debt: RestructuredDebt, *, booking_date: date) -> (
+        Transition[
+            OverdueDebt, RestructuringCancelledToOverdueEvent | LoanBecameOverdueEvent | LoanOverdueCancelledEvent
+        ]
+        | Transition[ActiveDebt, RestructuringCancelledToActiveEvent | LoanOverdueCancelledEvent]
+    ):
+        transfers = transferred_payments(debt.restructuring.loans)
+        rolled_back = [self._roll_back(loan, transfers.get(loan.id, ()), booking_date) for loan in debt.loans]
+        loans = tuple(loan for loan, _ in rolled_back)
+        loan_events = tuple(event for _, events in rolled_back for event in events)
+        restructuring_id = debt.restructuring.id
+
+        if any(isinstance(loan, OverdueLoan) for loan in loans):
+            overdue: Transition[
+                OverdueDebt, RestructuringCancelledToOverdueEvent | LoanBecameOverdueEvent | LoanOverdueCancelledEvent
+            ] = Transition(
+                OverdueDebt(id=debt.id, loans=loans),
+                (RestructuringCancelledToOverdueEvent(debt_id=debt.id, restructuring_id=restructuring_id), *loan_events),
+            )
+            return overdue
+
+        cancelled_events = tuple(event for event in loan_events if isinstance(event, LoanOverdueCancelledEvent))
+        active: Transition[ActiveDebt, RestructuringCancelledToActiveEvent | LoanOverdueCancelledEvent] = Transition(
+            ActiveDebt(id=debt.id, loans=tuple(loan for loan in loans if not isinstance(loan, OverdueLoan))),
+            (RestructuringCancelledToActiveEvent(debt_id=debt.id, restructuring_id=restructuring_id), *cancelled_events),
+        )
+        return active
+
+    def _roll_back(
+        self, loan: Loan, transferred: tuple[ReceivedPayment, ...], booking_date: date
+    ) -> tuple[Loan, tuple[LoanBecameOverdueEvent | LoanOverdueCancelledEvent, ...]]:
+        payments = (*loan.payments, *transferred)
+        match loan:
+            case ActiveLoan():
+                return self.recalculate_loan_terms.execute(
+                    ActiveLoan(**loan_fields(loan, payments=payments)), booking_date=booking_date
+                )
+            case OverdueLoan():
+                overdue, _ = self.accrue_penalty.execute(
+                    OverdueLoan(**loan_fields(loan, payments=payments)), booking_date=booking_date
+                )
+                if overdue_installments(overdue):
+                    return overdue, ()
+                return self.cancel_loan_overdue.execute(overdue, schedule=overdue.schedule)
+            case ClosedLoan():
+                return loan, ()
+
+
+class RecalculateDebtOperation(Operation[DebtState]):
+    """Daily recalculation: move the booking date of every open loan.
+
+    Active loans may become overdue (and then the debt does), overdue loans accrue penalty,
+    closed loans are left as they are. A restructured debt recalculates its restructuring
+    loans; once one of them would become overdue, the restructuring is cancelled.
+    """
+
+    recalculate_loan_terms: RecalculateLoanTermsOperation
+    accrue_penalty: AccruePenaltyOperation
+    cancel_restructuring: CancelRestructuringOperation
 
     @overload
     def execute(self, debt: ActiveDebt, *, booking_date: date) -> (
@@ -139,10 +307,26 @@ class RecalculateDebtOperation(Operation[DebtState]):
     ): ...
     @overload
     def execute(self, debt: OverdueDebt, *, booking_date: date) -> Transition[OverdueDebt, LoanBecameOverdueEvent]: ...
-    def execute(self, debt: ActiveDebt | OverdueDebt, *, booking_date: date) -> (
+    @overload
+    def execute(self, debt: RestructuredDebt, *, booking_date: date) -> (
+        Transition[RestructuredDebt, Never]
+        | Transition[
+            OverdueDebt, RestructuringCancelledToOverdueEvent | LoanBecameOverdueEvent | LoanOverdueCancelledEvent
+        ]
+        | Transition[ActiveDebt, RestructuringCancelledToActiveEvent | LoanOverdueCancelledEvent]
+    ): ...
+    def execute(self, debt: ActiveDebt | OverdueDebt | RestructuredDebt, *, booking_date: date) -> (
         Transition[OverdueDebt, DebtBecameOverdueEvent | LoanBecameOverdueEvent]
         | Transition[ActiveDebt, Never]
+        | Transition[RestructuredDebt, Never]
+        | Transition[
+            OverdueDebt, RestructuringCancelledToOverdueEvent | LoanBecameOverdueEvent | LoanOverdueCancelledEvent
+        ]
+        | Transition[ActiveDebt, RestructuringCancelledToActiveEvent | LoanOverdueCancelledEvent]
     ):
+        if isinstance(debt, RestructuredDebt):
+            return self._recalculate_restructured(debt, booking_date)
+
         moved = [self._recalculate(loan, booking_date) for loan in debt.loans]
         loans = tuple(loan for loan, _ in moved)
         loan_events = tuple(event for _, events in moved for event in events)
@@ -155,12 +339,37 @@ class RecalculateDebtOperation(Operation[DebtState]):
                 )
                 return unchanged
             case ActiveDebt():
-                return Transition(
+                became_overdue: Transition[OverdueDebt, DebtBecameOverdueEvent | LoanBecameOverdueEvent] = Transition(
                     OverdueDebt(id=debt.id, loans=loans),
                     (DebtBecameOverdueEvent(debt_id=debt.id), *loan_events),
                 )
+                return became_overdue
             case OverdueDebt():
-                return Transition(OverdueDebt(id=debt.id, loans=loans), loan_events)
+                still_overdue: Transition[OverdueDebt, LoanBecameOverdueEvent] = Transition(
+                    OverdueDebt(id=debt.id, loans=loans), loan_events
+                )
+                return still_overdue
+
+    def _recalculate_restructured(self, debt: RestructuredDebt, booking_date: date) -> (
+        Transition[RestructuredDebt, Never]
+        | Transition[
+            OverdueDebt, RestructuringCancelledToOverdueEvent | LoanBecameOverdueEvent | LoanOverdueCancelledEvent
+        ]
+        | Transition[ActiveDebt, RestructuringCancelledToActiveEvent | LoanOverdueCancelledEvent]
+    ):
+        moved = tuple(loan for loan, _ in (self._recalculate(loan, booking_date) for loan in debt.restructuring.loans))
+        if any(isinstance(loan, OverdueLoan) for loan in moved):
+            # An overdue breaks the restructuring agreement
+            return self.cancel_restructuring.execute(debt, booking_date=booking_date)
+        restructuring = ActiveRestructuring(
+            id=debt.restructuring.id,
+            applied_at=debt.restructuring.applied_at,
+            loans=tuple(loan for loan in moved if not isinstance(loan, OverdueLoan)),
+        )
+        unchanged: Transition[RestructuredDebt, Never] = Transition(
+            RestructuredDebt(id=debt.id, loans=debt.loans, restructuring=restructuring), ()
+        )
+        return unchanged
 
     def _recalculate(self, loan: Loan, booking_date: date) -> tuple[Loan, tuple[LoanBecameOverdueEvent, ...]]:
         match loan:
@@ -205,6 +414,10 @@ class ReceiveDebtPaymentOperation(Operation[DebtState]):
     ) -> Transition[ActiveDebt, PaymentReceivedEvent]: ...
     @overload
     def execute(
+        self, debt: RestructuredDebt, *, loan: ActiveLoan, payment_id: int, amount: Decimal, paid_at: date
+    ) -> Transition[RestructuredDebt, PaymentReceivedEvent]: ...
+    @overload
+    def execute(
         self, debt: OverdueDebt, *, loan: ActiveLoan | OverdueLoan, payment_id: int, amount: Decimal, paid_at: date
     ) -> (
         Transition[ActiveDebt, DebtOverdueCancelledEvent | LoanOverdueCancelledEvent | PaymentReceivedEvent]
@@ -212,7 +425,7 @@ class ReceiveDebtPaymentOperation(Operation[DebtState]):
     ): ...
     def execute(
         self,
-        debt: ActiveDebt | OverdueDebt,
+        debt: ActiveDebt | OverdueDebt | RestructuredDebt,
         *,
         loan: ActiveLoan | OverdueLoan,
         payment_id: int,
@@ -220,12 +433,30 @@ class ReceiveDebtPaymentOperation(Operation[DebtState]):
         paid_at: date,
     ) -> (
         Transition[ActiveDebt, PaymentReceivedEvent]
+        | Transition[RestructuredDebt, PaymentReceivedEvent]
         | Transition[ActiveDebt, DebtOverdueCancelledEvent | LoanOverdueCancelledEvent | PaymentReceivedEvent]
         | Transition[OverdueDebt, LoanOverdueCancelledEvent | PaymentReceivedEvent]
     ):
         paid_loan, payment_events = self.receive_loan_payment.execute(
             loan, payment_id=payment_id, amount=amount, paid_at=paid_at
         )
+
+        if isinstance(debt, RestructuredDebt):
+            # Payments of a restructured debt go to its restructuring loans
+            restructuring = ActiveRestructuring(
+                id=debt.restructuring.id,
+                applied_at=debt.restructuring.applied_at,
+                loans=tuple(
+                    item
+                    for item in replace_loan(debt.restructuring.loans, paid_loan)
+                    if not isinstance(item, OverdueLoan)
+                ),
+            )
+            restructured: Transition[RestructuredDebt, PaymentReceivedEvent] = Transition(
+                RestructuredDebt(id=debt.id, loans=debt.loans, restructuring=restructuring), payment_events
+            )
+            return restructured
+
         loans = replace_loan(debt.loans, paid_loan)
 
         if isinstance(debt, ActiveDebt):
@@ -257,9 +488,14 @@ class ReceiveDebtPaymentOperation(Operation[DebtState]):
 
 
 class CloseDebtOperation(Operation[DebtState]):
-    """Close a debt: every loan that is not closed yet must be repaid and gets closed."""
+    """Close a debt: every loan that is not closed yet must be repaid and gets closed.
+
+    A restructured debt is closed on the restructuring terms: its restructuring is closed, and
+    the original loans stay as they were when the restructuring was applied.
+    """
 
     close_loan: CloseLoanOperation
+    close_restructuring: CloseRestructuringOperation
 
     @overload
     def execute(
@@ -271,20 +507,45 @@ class CloseDebtOperation(Operation[DebtState]):
     ) -> Transition[
         ClosedDebt, OverdueDebtClosedEvent | ActiveLoanClosedEvent | OverdueLoanClosedEvent
     ]: ...
-    def execute(self, debt: ActiveDebt | OverdueDebt) -> Transition[
-        ClosedDebt,
-        ActiveDebtClosedEvent | OverdueDebtClosedEvent | ActiveLoanClosedEvent | OverdueLoanClosedEvent,
-    ]:
+    @overload
+    def execute(
+        self, debt: RestructuredDebt
+    ) -> Transition[
+        ClosedRestructuredDebt, RestructuredDebtClosedEvent | RestructuringClosedEvent | ActiveLoanClosedEvent
+    ]: ...
+    def execute(self, debt: ActiveDebt | OverdueDebt | RestructuredDebt) -> (
+        Transition[
+            ClosedDebt,
+            ActiveDebtClosedEvent | OverdueDebtClosedEvent | ActiveLoanClosedEvent | OverdueLoanClosedEvent,
+        ]
+        | Transition[
+            ClosedRestructuredDebt, RestructuredDebtClosedEvent | RestructuringClosedEvent | ActiveLoanClosedEvent
+        ]
+    ):
+        if isinstance(debt, RestructuredDebt):
+            restructuring, events = self.close_restructuring.execute(debt.restructuring)
+            closed_restructured = ClosedRestructuredDebt(id=debt.id, loans=debt.loans, restructuring=restructuring)
+            on_terms: Transition[
+                ClosedRestructuredDebt, RestructuredDebtClosedEvent | RestructuringClosedEvent | ActiveLoanClosedEvent
+            ] = Transition(
+                closed_restructured,
+                (RestructuredDebtClosedEvent(debt_id=debt.id, restructuring_id=restructuring.id), *events),
+            )
+            return on_terms
+
         closed = [self._close(loan) for loan in debt.loans]
         loans = tuple(loan for loan, _ in closed)
         loan_events = tuple(event for _, events in closed for event in events)
 
         closed_debt = ClosedDebt(id=debt.id, loans=loans)
-        match debt:
-            case ActiveDebt():
-                return Transition(closed_debt, (ActiveDebtClosedEvent(debt_id=debt.id), *loan_events))
-            case OverdueDebt():
-                return Transition(closed_debt, (OverdueDebtClosedEvent(debt_id=debt.id), *loan_events))
+        closed_event = ActiveDebtClosedEvent(debt_id=debt.id) if isinstance(debt, ActiveDebt) else (
+            OverdueDebtClosedEvent(debt_id=debt.id)
+        )
+        closed_transition: Transition[
+            ClosedDebt,
+            ActiveDebtClosedEvent | OverdueDebtClosedEvent | ActiveLoanClosedEvent | OverdueLoanClosedEvent,
+        ] = Transition(closed_debt, (closed_event, *loan_events))
+        return closed_transition
 
     def _close(
         self, loan: Loan
