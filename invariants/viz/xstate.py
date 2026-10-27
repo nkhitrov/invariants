@@ -5,6 +5,7 @@ import importlib
 import inspect
 import json
 import shutil
+import subprocess
 import sys
 import types
 import typing
@@ -557,7 +558,7 @@ def render_configs(configs: dict[str, dict[str, Any]]) -> str:
 
 _SKETCH_DIR_NAME = ".sketch"
 _SKETCH_REPO_URL = "https://github.com/statelyai/sketch.git"
-# Matches the `packageManager` field of statelyai/sketch; used when pnpm is not on PATH.
+# The `packageManager` of statelyai/sketch when this was written; used when its package.json doesn't name one.
 _PNPM_VERSION = "10.32.1"
 
 
@@ -585,13 +586,51 @@ def _sketch_env(port: int, base: dict[str, str] | None = None) -> dict[str, str]
     }
 
 
-def _pnpm_command() -> list[str]:
-    """Return the command prefix that runs pnpm: the binary itself, or ``npx pnpm@<version>``."""
-    if shutil.which("pnpm"):
+def _sketch_pnpm_version(sketch_dir: Path) -> str:
+    """The pnpm version Sketch pins in the ``packageManager`` field of its package.json."""
+    try:
+        package = json.loads((sketch_dir / "package.json").read_text())
+    except (OSError, ValueError):
+        return _PNPM_VERSION
+    manager = package.get("packageManager") if isinstance(package, dict) else None
+    if not isinstance(manager, str) or not manager.startswith("pnpm@"):
+        return _PNPM_VERSION
+    # "pnpm@10.32.1+sha512.<hash>" -> "10.32.1"
+    return manager.removeprefix("pnpm@").split("+", 1)[0]
+
+
+def _installed_pnpm_version() -> str | None:
+    """Version of the pnpm on PATH, or None if it can't be run."""
+    try:
+        result = subprocess.run(["pnpm", "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    version = result.stdout.strip()
+    return version if result.returncode == 0 and version else None
+
+
+def _major(version: str) -> str:
+    return version.split(".", 1)[0]
+
+
+def _pnpm_command(version: str = _PNPM_VERSION) -> list[str]:
+    """Return the command prefix that runs pnpm ``version``.
+
+    The pnpm on PATH is used only when its major version matches: another major reads the
+    workspace and lockfile differently (pnpm 9 rejects Sketch's ``pnpm-workspace.yaml``).
+    Otherwise pnpm is run through ``npx pnpm@<version>``.
+    """
+    installed = _installed_pnpm_version() if shutil.which("pnpm") else None
+    if installed is not None and _major(installed) == _major(version):
         return ["pnpm"]
     if shutil.which("npx"):
-        return ["npx", "--yes", f"pnpm@{_PNPM_VERSION}"]
-    print("Error: 'pnpm' or 'npx' (Node.js) is required but not found in PATH", file=sys.stderr)
+        if installed is not None:
+            print(f"pnpm {installed} on PATH, Sketch needs pnpm {version}: using npx", file=sys.stderr)
+        return ["npx", "--yes", f"pnpm@{version}"]
+    if installed is not None:
+        print(f"Error: Sketch needs pnpm {version}, found pnpm {installed} and no npx", file=sys.stderr)
+    else:
+        print("Error: 'pnpm' or 'npx' (Node.js) is required but not found in PATH", file=sys.stderr)
     sys.exit(1)
 
 
@@ -619,8 +658,6 @@ def _get_sketch_dir() -> Path:  # pragma: no cover
 
 def _ensure_sketch() -> Path:  # pragma: no cover
     """Ensure statelyai/sketch is cloned and has node_modules installed. Returns the path."""
-    import subprocess
-
     sketch_dir = _get_sketch_dir()
 
     if not (sketch_dir / "package.json").exists():
@@ -631,7 +668,7 @@ def _ensure_sketch() -> Path:  # pragma: no cover
         )
 
     if not (sketch_dir / "node_modules").exists():
-        pnpm = _pnpm_command()
+        pnpm = _pnpm_command(_sketch_pnpm_version(sketch_dir))
         print("Installing Sketch dependencies (pnpm install) ...")
         subprocess.run(
             [*pnpm, "install", "--frozen-lockfile"],
@@ -679,7 +716,6 @@ def serve(module_path: str, port: int = 3000) -> None:  # pragma: no cover
     import os
     import signal
     import socket
-    import subprocess
     import time
     import webbrowser
 
@@ -701,7 +737,7 @@ def serve(module_path: str, port: int = 3000) -> None:  # pragma: no cover
     print(f"Root state(s): {', '.join(configs)}")
 
     sketch_dir = _ensure_sketch()
-    pnpm = _pnpm_command()
+    pnpm = _pnpm_command(_sketch_pnpm_version(sketch_dir))
 
     print(f"Starting Sketch on http://127.0.0.1:{port} ...")
     proc = subprocess.Popen(
