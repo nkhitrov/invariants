@@ -5,25 +5,24 @@ from typing import Any, Never, cast, overload
 
 import pytest
 
-from examples.debt import ActiveDebt, DebtBecameOverdueEvent, DebtOpenedEvent, DebtState, OverdueDebt
-from examples.loan import (
-    AccruePenaltyOperation,
-    ActiveLoan,
+from examples.debt.events import DebtBecameOverdueEvent, DebtOpenedEvent
+from examples.debt.states import ActiveDebt, DebtState, OverdueDebt
+from examples.loan.events import (
     ActiveLoanClosedEvent,
-    CancelLoanOverdueOperation,
-    CloseLoanOperation,
-    ClosedLoan,
-    Installment,
-    IssueLoanOperation,
     LoanBecameOverdueEvent,
     LoanIssuedEvent,
     LoanOverdueCancelledEvent,
-    LoanState,
-    OverdueLoan,
     OverdueLoanClosedEvent,
+)
+from examples.loan.operations import (
+    AccruePenaltyOperation,
+    CancelLoanOverdueOperation,
+    CloseLoanOperation,
+    IssueLoanOperation,
     RecalculateLoanTermsOperation,
 )
-from examples.payment import PaymentReceivedEvent
+from examples.loan.states import ActiveLoan, ClosedLoan, Installment, LoanState, OverdueLoan
+from examples.payment.events import PaymentReceivedEvent
 from invariants.operations import (
     EdgeRegistry,
     Operation,

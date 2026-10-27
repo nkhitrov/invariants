@@ -6,35 +6,21 @@ from decimal import Decimal
 import pytest
 
 from examples.calculations import accrued_penalty, allocate_loan, is_repaid
-from examples.debt import (
-    ActiveDebt,
+from examples.debt.events import (
     ActiveDebtRestructuredEvent,
-    ClosedRestructuredDebt,
-    OverdueDebt,
     OverdueDebtRestructuredEvent,
-    RestructuredDebt,
     RestructuredDebtClosedEvent,
     RestructuringCancelledToActiveEvent,
     RestructuringCancelledToOverdueEvent,
-    UnknownOriginalLoanError,
 )
-from examples.loan import (
-    ActiveLoan,
-    ActiveLoanClosedEvent,
-    ClosedLoan,
-    Installment,
-    LoanIssuedEvent,
-    LoanOverdueCancelledEvent,
-    OverdueLoan,
-)
-from examples.payment import PaymentReceivedEvent, ReceivedPayment
-from examples.restructuring import (
-    ClosedRestructuring,
-    LoanTerms,
-    RestructuringAppliedEvent,
-    RestructuringClosedEvent,
-    RestructuringTerms,
-)
+from examples.debt.operations import UnknownOriginalLoanError
+from examples.debt.states import ActiveDebt, ClosedRestructuredDebt, OverdueDebt, RestructuredDebt
+from examples.loan.events import ActiveLoanClosedEvent, LoanIssuedEvent, LoanOverdueCancelledEvent
+from examples.loan.states import ActiveLoan, ClosedLoan, Installment, OverdueLoan
+from examples.payment.events import PaymentReceivedEvent
+from examples.payment.states import ReceivedPayment
+from examples.restructuring.events import RestructuringAppliedEvent, RestructuringClosedEvent
+from examples.restructuring.states import ClosedRestructuring, LoanTerms, RestructuringTerms
 from tests.support.wiring import (
     apply_restructuring,
     cancel_restructuring,

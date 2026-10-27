@@ -3,8 +3,9 @@ from typing import TypeVar
 import pytest
 from pydantic import ValidationError
 
-from examples.debt import ActiveDebt
-from examples.loan import ActiveLoan, ClosedLoan, LoanBecameOverdueEvent, LoanIssuedEvent, LoanState, OverdueLoan
+from examples.debt.states import ActiveDebt
+from examples.loan.events import LoanBecameOverdueEvent, LoanIssuedEvent
+from examples.loan.states import ActiveLoan, ClosedLoan, LoanState, OverdueLoan
 from invariants.operations import EdgeRegistry, Event, get_event_edge
 
 

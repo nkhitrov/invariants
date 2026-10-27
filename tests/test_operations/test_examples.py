@@ -6,35 +6,34 @@ from decimal import Decimal
 import pytest
 
 from examples.calculations import accrued_penalty, is_repaid, outstanding_amount, overdue_installments, paid_amount
-from examples.debt import (
-    ActiveDebt,
+from examples.debt.events import (
     ActiveDebtClosedEvent,
-    CheckDebtOverdueDaysQuery,
-    ClosedDebt,
     DebtBecameOverdueEvent,
     DebtOpenedEvent,
     DebtOverdueCancelledEvent,
-    DebtStillOverdueError,
-    LoanNotFoundError,
-    OverdueDebt,
     OverdueDebtClosedEvent,
 )
-from examples.loan import (
-    AccruePenaltyOperation,
-    ActiveLoan,
+from examples.debt.operations import (
+    CheckDebtOverdueDaysQuery,
+    DebtStillOverdueError,
+    LoanNotFoundError,
+)
+from examples.debt.states import ActiveDebt, ClosedDebt, OverdueDebt
+from examples.loan.events import (
     ActiveLoanClosedEvent,
-    CloseLoanOperation,
-    ClosedLoan,
-    Installment,
     LoanBecameOverdueEvent,
     LoanIssuedEvent,
-    LoanNotRepaidError,
     LoanOverdueCancelledEvent,
-    LoanStillOverdueError,
-    OverdueLoan,
     OverdueLoanClosedEvent,
 )
-from examples.payment import PaymentReceivedEvent
+from examples.loan.operations import (
+    AccruePenaltyOperation,
+    CloseLoanOperation,
+    LoanNotRepaidError,
+    LoanStillOverdueError,
+)
+from examples.loan.states import ActiveLoan, ClosedLoan, Installment, OverdueLoan
+from examples.payment.events import PaymentReceivedEvent
 from tests.support.wiring import (
     cancel_debt_overdue,
     cancel_loan_overdue,

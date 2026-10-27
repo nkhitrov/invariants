@@ -237,13 +237,13 @@ class ReceiveLoanPaymentOperation(Operation[LoanState]):
 operation = ReceiveLoanPaymentOperation(receive_payment=ReceivePaymentOperation())
 ```
 
-The debt example ([`examples/debt.py`](examples/debt.py)) composes the same way: `RecalculateDebtOperation`
+The debt example ([`examples/debt/operations.py`](examples/debt/operations.py)) composes the same way: `RecalculateDebtOperation`
 delegates to the loan recalculation and penalty operations, and `ReceiveDebtPaymentOperation` pays a loan and,
 once no installment is overdue, delegates `OverdueDebt → ActiveDebt` to its owner `CancelDebtOverdueOperation`.
 
 ### Example: debt restructuring
 
-[`examples/restructuring.py`](examples/restructuring.py) and [`examples/debt.py`](examples/debt.py) show a nested
+[`examples/restructuring/`](examples/restructuring) and [`examples/debt/`](examples/debt) show a nested
 entity two levels deep (debt → restructuring → loans):
 
 - The terms are approved outside the invariants and come in as a value object: `RestructuringTerms(id, loans)`, where
@@ -292,8 +292,11 @@ class LoanPaidEvent(Event[ActiveLoan, ClosedLoan], registry=registry):
     loan_id: int
 ```
 
-The full example lives in [`examples/`](examples): [`loan.py`](examples/loan.py), [`debt.py`](examples/debt.py),
-[`payment.py`](examples/payment.py) and [`calculations.py`](examples/calculations.py).
+The full example lives in [`examples/`](examples). Each aggregate — [`payment`](examples/payment),
+[`loan`](examples/loan), [`restructuring`](examples/restructuring) and [`debt`](examples/debt) — is a package that keeps
+invariants and operations apart: `states.py` holds the states and value objects, `events.py` the events of their
+edges, and `operations.py` the operations over them. Money is computed by the pure functions of
+[`calculations.py`](examples/calculations.py).
 
 ## Factories (Testing)
 
@@ -309,7 +312,7 @@ Define factories for concrete states — the model is inferred from the generic 
 from invariants.factories import StateFactory
 
 
-from examples.debt import ActiveDebt
+from examples.debt.states import ActiveDebt
 
 
 class ActiveLoanFactory(StateFactory[ActiveLoan]): ...
@@ -351,11 +354,11 @@ operation, and the creation edge (`None → B`) sets the initial state:
 
 ```bash
 # Print generated JS — paste it into https://sketch.stately.ai
-python -m invariants.viz print examples.debt
+python -m invariants.viz print examples.debt.operations
 
 # Start a local Stately Sketch with one document per state machine
 # (clones https://github.com/statelyai/sketch on first run; needs Node.js with pnpm or npx)
-python -m invariants.viz serve examples.debt
+python -m invariants.viz serve examples.debt.operations
 ```
 
 `serve` opens each machine in the browser

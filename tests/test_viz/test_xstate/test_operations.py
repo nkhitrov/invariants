@@ -1,24 +1,22 @@
 import importlib
 
-from examples.debt import (
+from examples.debt.operations import (
     CancelDebtOverdueOperation,
     CheckDebtOverdueDaysQuery,
     CloseDebtOperation,
     OpenDebtOperation,
-    OverdueDebt,
     RecalculateDebtOperation,
     ReceiveDebtPaymentOperation,
 )
-from examples.loan import (
+from examples.debt.states import OverdueDebt
+from examples.loan.events import LoanBecameOverdueEvent
+from examples.loan.operations import (
     AccruePenaltyOperation,
-    ActiveLoan,
     CloseLoanOperation,
-    ClosedLoan,
     IssueLoanOperation,
-    LoanBecameOverdueEvent,
-    OverdueLoan,
     RecalculateLoanTermsOperation,
 )
+from examples.loan.states import ActiveLoan, ClosedLoan, OverdueLoan
 from invariants.operations import Transition as OperationTransition
 from invariants.viz.xstate import (
     Transition,
@@ -92,7 +90,7 @@ class TestOperationConfig:
 
     def test_same_nested_field_everywhere_gives_no_guard(self) -> None:
         """Every loan state holds ``tuple[ReceivedPayment, ...]``: no guard tells them apart."""
-        code = render_xstate_code(discover_machines(importlib.import_module("examples.loan")))
+        code = render_xstate_code(discover_machines(importlib.import_module("examples.loan.operations")))
         assert "onlyReceivedPayment" not in code
         assert "LoanBecameOverdueEvent: 'OverdueLoan'," in code
 
@@ -118,7 +116,7 @@ class TestOperationConfig:
         assert "AccruePenaltyOperation: [{}]," in code
 
     def test_discovers_operations_of_examples(self) -> None:
-        machines = discover_machines(importlib.import_module("examples.debt"))
+        machines = discover_machines(importlib.import_module("examples.debt.operations"))
         names = {m.__name__ for m in machines}
         assert {"OpenDebtOperation", "CheckDebtOverdueDaysQuery", "CloseLoanOperation"} <= names
 
@@ -127,16 +125,16 @@ class TestTwoLevelNesting:
     """Debt → restructuring → loans."""
 
     def test_nested_roots_are_transitive(self) -> None:
-        from examples.debt import DebtState
-        from examples.loan import LoanState
-        from examples.payment import PaymentState
-        from examples.restructuring import RestructuringState
+        from examples.debt.states import DebtState
+        from examples.loan.states import LoanState
+        from examples.payment.states import PaymentState
+        from examples.restructuring.states import RestructuringState
         from invariants.hierarchy import get_nested_roots
 
         assert get_nested_roots(DebtState) == {LoanState, RestructuringState, PaymentState}
 
     def test_restructured_debt_in_diagram(self) -> None:
-        configs = build_xstate_config(discover_machines(importlib.import_module("examples.debt")))
+        configs = build_xstate_config(discover_machines(importlib.import_module("examples.debt.operations")))
         restructured = configs["DebtState"]["states"]["RestructuredDebt"]["on"]
         assert restructured["RecalculateDebtOperation"] == [{}]
         assert {"RestructuringCancelledToOverdueEvent", "RestructuringCancelledToActiveEvent",

@@ -264,11 +264,15 @@ def _get_imported_modules(module: types.ModuleType) -> list[types.ModuleType]:
         obj = getattr(module, name)
         if isinstance(obj, types.ModuleType) and obj is not module:
             result.append(obj)
-    # Also check for 'from X import Y' — scan sys.modules for modules
-    # whose names appear as prefixes of imported State classes
+    # Also check for 'from X import Y' — scan sys.modules for modules of imported State
+    # classes and machines (states and operations often live in separate modules)
     for name in dir(module):
         obj = getattr(module, name)
-        if isinstance(obj, type) and issubclass(obj, State) and obj.__module__ != module.__name__:
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, (State, StateMachine))
+            and obj.__module__ != module.__name__
+        ):
             imported_mod = sys.modules.get(obj.__module__)
             if imported_mod is not None and imported_mod not in result:
                 result.append(imported_mod)
@@ -788,10 +792,10 @@ def main() -> None:  # pragma: no cover
     subparsers = parser.add_subparsers(dest="command")
 
     print_parser = subparsers.add_parser("print", help="Print xstate JS code to stdout")
-    print_parser.add_argument("module", help="Python module path to scan (e.g. examples.example)")
+    print_parser.add_argument("module", help="Python module path to scan (e.g. examples.debt.operations)")
 
     serve_parser = subparsers.add_parser("serve", help="Start xstate-viz dev server")
-    serve_parser.add_argument("module", help="Python module path to scan (e.g. examples.example)")
+    serve_parser.add_argument("module", help="Python module path to scan (e.g. examples.debt.operations)")
     serve_parser.add_argument("-p", "--port", type=int, default=3000, help="Dev server port (default: 3000)")
 
     args = parser.parse_args()

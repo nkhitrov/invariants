@@ -1,81 +1,23 @@
-"""Debt restructuring: new loans that replace the original ones on agreed terms.
-
-The terms are approved outside the invariants and come in as a value object. Every installment
-of a restructuring loan names the original loan it pays off (``Installment.original_loan_id``),
-so original and restructuring loans map 1:1 or N:M.
-"""
-
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
-from typing import Annotated, Literal
-
-from pydantic import BaseModel, ConfigDict, Field
 
 from examples.calculations import ZERO
-from examples.loan import (
-    ActiveLoan,
-    ActiveLoanClosedEvent,
-    CloseLoanOperation,
-    ClosedLoan,
-    Installment,
-    IssueLoanOperation,
-    LoanIssuedEvent,
+from examples.loan.events import ActiveLoanClosedEvent, LoanIssuedEvent
+from examples.loan.operations import CloseLoanOperation, IssueLoanOperation
+from examples.loan.states import ActiveLoan, ClosedLoan, Installment
+from examples.payment.states import ReceivedPayment
+from examples.restructuring.events import (
+    RestructuringAppliedEvent,
+    RestructuringClosedEvent,
 )
-from examples.payment import ReceivedPayment
-from invariants.conditions import ContainsOne
-from invariants.operations import Event, Operation, Transition
-from invariants.state import State, Statefull
-
-
-class LoanTerms(BaseModel):
-    """Terms of one restructuring loan."""
-
-    model_config = ConfigDict(frozen=True, strict=True)
-
-    loan_id: int
-    financed_amount: Decimal
-    schedule: Annotated[tuple[Installment, ...], Field(min_length=1)]
-
-
-class RestructuringTerms(BaseModel):
-    """Approved restructuring: the new loans."""
-
-    model_config = ConfigDict(frozen=True, strict=True)
-
-    id: int
-    loans: Annotated[tuple[LoanTerms, ...], Field(min_length=1)]
-
-
-class RestructuringState(State):
-    """A restructuring of a debt. It is a nested entity of the debt."""
-
-    id: int
-    applied_at: date
-    status: Statefull
-    loans: Statefull
-
-
-class ActiveRestructuring(RestructuringState):
-    """Being paid by the new schedule. An overdue here breaks the agreement and cancels it."""
-
-    status: Literal["active"] = "active"
-    loans: Annotated[tuple[ActiveLoan | ClosedLoan, ...], ContainsOne(ActiveLoan)]
-
-
-class ClosedRestructuring(RestructuringState):
-    """Every restructuring loan is repaid and closed."""
-
-    status: Literal["closed"] = "closed"
-    loans: tuple[ClosedLoan, ...]
-
-
-class RestructuringAppliedEvent(Event[None, ActiveRestructuring]):
-    restructuring_id: int
-
-
-class RestructuringClosedEvent(Event[ActiveRestructuring, ClosedRestructuring]):
-    restructuring_id: int
+from examples.restructuring.states import (
+    ActiveRestructuring,
+    ClosedRestructuring,
+    RestructuringState,
+    RestructuringTerms,
+)
+from invariants.operations import Operation, Transition
 
 
 class OpenRestructuringOperation(Operation[RestructuringState]):

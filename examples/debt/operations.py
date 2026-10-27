@@ -1,100 +1,59 @@
 from datetime import date
 from decimal import Decimal
-from typing import Annotated, Literal, Never, overload
+from typing import Never, overload
 
 from examples.calculations import overdue_days, overdue_installments
-from examples.loan import (
-    AccruePenaltyOperation,
-    ActiveLoan,
+from examples.debt.events import (
+    ActiveDebtClosedEvent,
+    ActiveDebtRestructuredEvent,
+    DebtBecameOverdueEvent,
+    DebtOpenedEvent,
+    DebtOverdueCancelledEvent,
+    OverdueDebtClosedEvent,
+    OverdueDebtRestructuredEvent,
+    RestructuredDebtClosedEvent,
+    RestructuringCancelledToActiveEvent,
+    RestructuringCancelledToOverdueEvent,
+)
+from examples.debt.states import (
+    ActiveDebt,
+    ClosedDebt,
+    ClosedRestructuredDebt,
+    DebtState,
+    Loan,
+    OverdueDebt,
+    RestructuredDebt,
+)
+from examples.loan.events import (
     ActiveLoanClosedEvent,
-    CancelLoanOverdueOperation,
-    CloseLoanOperation,
-    ClosedLoan,
-    Installment,
-    IssueLoanOperation,
     LoanBecameOverdueEvent,
     LoanIssuedEvent,
     LoanOverdueCancelledEvent,
-    OverdueLoan,
     OverdueLoanClosedEvent,
-    ReceiveLoanPaymentOperation,
+)
+from examples.loan.operations import (
+    AccruePenaltyOperation,
+    CancelLoanOverdueOperation,
+    CloseLoanOperation,
+    IssueLoanOperation,
     RecalculateLoanTermsOperation,
+    ReceiveLoanPaymentOperation,
     loan_fields,
 )
-from examples.payment import PaymentReceivedEvent, ReceivedPayment
-from examples.restructuring import (
-    ActiveRestructuring,
-    CloseRestructuringOperation,
-    ClosedRestructuring,
-    OpenRestructuringOperation,
+from examples.loan.states import ActiveLoan, ClosedLoan, Installment, OverdueLoan
+from examples.payment.events import PaymentReceivedEvent
+from examples.payment.states import ReceivedPayment
+from examples.restructuring.events import (
     RestructuringAppliedEvent,
     RestructuringClosedEvent,
-    RestructuringTerms,
+)
+from examples.restructuring.operations import (
+    CloseRestructuringOperation,
+    OpenRestructuringOperation,
     transferred_payments,
 )
-from invariants.conditions import ContainsOne
-from invariants.operations import Event, Operation, Query, Transition
-from invariants.state import State, Statefull
-
-Loan = ActiveLoan | OverdueLoan | ClosedLoan
-
-
-class DebtState(State):
-    """Debt. It has no money of its own: its state is derived from the states of its loans.
-
-    ``loans`` are the original loans; ``restructuring`` holds the loans that replace them
-    while the debt is restructured.
-    """
-
-    id: int
-    status: Statefull
-    loans: Statefull
-    restructuring: Statefull
-
-
-class ActiveDebt(DebtState):
-    """Active debt: every loan is active or closed, and at least one is active."""
-
-    status: Literal["active"] = "active"
-    loans: Annotated[tuple[ActiveLoan | ClosedLoan, ...], ContainsOne(ActiveLoan)]
-    restructuring: None = None
-
-
-class ClosedDebt(DebtState):
-    """Closed debt: every loan is closed."""
-
-    status: Literal["closed"] = "closed"
-    loans: tuple[ClosedLoan, ...]
-    restructuring: None = None
-
-
-class OverdueDebt(DebtState):
-    """Overdue debt: at least one loan is overdue."""
-
-    status: Literal["overdue"] = "overdue"
-    loans: Annotated[
-        tuple[OverdueLoan | ActiveLoan | ClosedLoan, ...], ContainsOne(OverdueLoan)
-    ]
-    restructuring: None = None
-
-
-class RestructuredDebt(DebtState):
-    """Paid by the restructuring loans; ``loans`` is the snapshot of the original loans, kept to roll back."""
-
-    status: Literal["restructured"] = "restructured"
-    loans: tuple[OverdueLoan | ActiveLoan | ClosedLoan, ...]
-    restructuring: ActiveRestructuring
-
-
-class ClosedRestructuredDebt(DebtState):
-    """Closed on the restructuring terms; ``loans`` is the same snapshot of the original loans."""
-
-    status: Literal["closed_restructured"] = "closed_restructured"
-    loans: tuple[OverdueLoan | ActiveLoan | ClosedLoan, ...]
-    restructuring: ClosedRestructuring
-
-
-Debt = ActiveDebt | ClosedDebt | OverdueDebt | RestructuredDebt | ClosedRestructuredDebt
+from examples.restructuring.states import ActiveRestructuring, RestructuringTerms
+from invariants.operations import Operation, Query, Transition
 
 
 class LoanNotFoundError(LookupError):
@@ -120,51 +79,6 @@ def replace_loan(loans: tuple[Loan, ...], loan: Loan) -> tuple[Loan, ...]:
     if all(item.id != loan.id for item in loans):
         raise LoanNotFoundError(loan.id)
     return tuple(loan if item.id == loan.id else item for item in loans)
-
-
-class DebtOpenedEvent(Event[None, ActiveDebt]):
-    debt_id: int
-
-
-class DebtBecameOverdueEvent(Event[ActiveDebt, OverdueDebt]):
-    debt_id: int
-
-
-class DebtOverdueCancelledEvent(Event[OverdueDebt, ActiveDebt]):
-    debt_id: int
-
-
-class ActiveDebtClosedEvent(Event[ActiveDebt, ClosedDebt]):
-    debt_id: int
-
-
-class OverdueDebtClosedEvent(Event[OverdueDebt, ClosedDebt]):
-    debt_id: int
-
-
-class ActiveDebtRestructuredEvent(Event[ActiveDebt, RestructuredDebt]):
-    debt_id: int
-    restructuring_id: int
-
-
-class OverdueDebtRestructuredEvent(Event[OverdueDebt, RestructuredDebt]):
-    debt_id: int
-    restructuring_id: int
-
-
-class RestructuringCancelledToOverdueEvent(Event[RestructuredDebt, OverdueDebt]):
-    debt_id: int
-    restructuring_id: int
-
-
-class RestructuringCancelledToActiveEvent(Event[RestructuredDebt, ActiveDebt]):
-    debt_id: int
-    restructuring_id: int
-
-
-class RestructuredDebtClosedEvent(Event[RestructuredDebt, ClosedRestructuredDebt]):
-    debt_id: int
-    restructuring_id: int
 
 
 class OpenDebtOperation(Operation[DebtState]):

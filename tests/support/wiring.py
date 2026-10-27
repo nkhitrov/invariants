@@ -1,6 +1,6 @@
 """Composition root of the example operations, shared by the scenario tests."""
 
-from examples.debt import (
+from examples.debt.operations import (
     ApplyRestructuringOperation,
     CancelDebtOverdueOperation,
     CancelRestructuringOperation,
@@ -9,7 +9,7 @@ from examples.debt import (
     RecalculateDebtOperation,
     ReceiveDebtPaymentOperation,
 )
-from examples.loan import (
+from examples.loan.operations import (
     AccruePenaltyOperation,
     CancelLoanOverdueOperation,
     CloseLoanOperation,
@@ -17,8 +17,11 @@ from examples.loan import (
     ReceiveLoanPaymentOperation,
     RecalculateLoanTermsOperation,
 )
-from examples.payment import ReceivePaymentOperation
-from examples.restructuring import CloseRestructuringOperation, OpenRestructuringOperation
+from examples.payment.operations import ReceivePaymentOperation
+from examples.restructuring.operations import (
+    CloseRestructuringOperation,
+    OpenRestructuringOperation,
+)
 
 issue_loan = IssueLoanOperation()
 recalculate_loan_terms = RecalculateLoanTermsOperation()
